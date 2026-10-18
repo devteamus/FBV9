@@ -8,7 +8,7 @@ FROM base AS deps
 RUN apk add --no-cache libc6-compat
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install --ignore-scripts
+RUN npm install --ignore-scripts --include=dev
 COPY prisma ./prisma/
 RUN npx prisma generate
 # Guarantee this path exists even if the engine cache ended up empty/elsewhere
