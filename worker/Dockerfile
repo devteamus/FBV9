@@ -7,7 +7,7 @@ FROM base AS deps
 RUN apk add --no-cache libc6-compat
 WORKDIR /app
 COPY package.json package-lock.json* ./
-RUN npm install --ignore-scripts
+RUN npm install --ignore-scripts --include=dev
 # Worker has its own copy of prisma/ in its build context
 COPY prisma ./prisma/
 RUN npx prisma generate
