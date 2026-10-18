@@ -1,0 +1,160 @@
+services:
+  # ──────────────────────────────────────────────
+  # PostgreSQL 16
+  # ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fbposter}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-fbposter}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-fbposter} -d ${POSTGRES_DB:-fbposter}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────
+  # Redis 7
+  # ──────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ──────────────────────────────────────────────
+  # Next.js Web App (UI + API routes)
+  # ──────────────────────────────────────────────
+  web:
+    build:
+      context: ./web
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # No `ports:` — Coolify's reverse proxy routes traffic to the
+    # container's internal port (3000, from web/Dockerfile's EXPOSE).
+    # Set the port + your domain in Coolify's dashboard, not here.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    environment:
+      # Server-only env vars (never prefixed NEXT_PUBLIC_)
+      DATABASE_URL: postgresql://${POSTGRES_USER:-fbposter}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fbposter}?connection_limit=10&pool_timeout=30
+      REDIS_URL: redis://redis:6379
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      NEXTAUTH_SECRET: ${JWT_SECRET}
+      NODE_ENV: ${NODE_ENV:-production}
+      MAX_CSV_ROWS: ${MAX_CSV_ROWS:-5000}
+      CSV_RETENTION_HOURS: ${CSV_RETENTION_HOURS:-24}
+      JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-15}
+      # Set this to your real https://yourdomain.com in Coolify's env vars UI
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+      # Email / password reset (Resend.com)
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      MAIL_FROM: ${MAIL_FROM:-onboarding@resend.dev}
+      # Set this to your real https://yourdomain.com in Coolify's env vars UI
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:3000}
+      # Security: refuse to boot with placeholder secrets in production
+      INSECURE_SECRETS: "false"
+    volumes:
+      - upload-data:/app/uploads
+
+  # ──────────────────────────────────────────────
+  # BullMQ Worker (standalone Node/TS process)
+  # ──────────────────────────────────────────────
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # NOTE: `deploy.replicas` is intentionally NOT used here. Coolify
+    # injects its own fixed container_name onto every compose service,
+    # which conflicts with replicas (Docker can't create N containers
+    # sharing one name) — this is an open, unresolved Coolify limitation
+    # (github.com/coollabsio/coolify/issues/2131). Instead we run 3
+    # independent, identically-configured worker services below. BullMQ
+    # doesn't care how many separate processes pull from the same Redis
+    # queue, so this behaves identically to 3 replicas.
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-fbposter}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fbposter}?connection_limit=10&pool_timeout=30
+      REDIS_URL: redis://redis:6379
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      NODE_ENV: ${NODE_ENV:-production}
+      MAX_RETRIES: ${MAX_RETRIES:-3}
+      CSV_RETENTION_HOURS: ${CSV_RETENTION_HOURS:-24}
+      JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-15}
+      FAST_QUEUE_CONCURRENCY: ${FAST_QUEUE_CONCURRENCY:-60}
+      MEDIA_QUEUE_CONCURRENCY: ${MEDIA_QUEUE_CONCURRENCY:-8}
+      VIDEO_UPLOAD_TIMEOUT_MS: ${VIDEO_UPLOAD_TIMEOUT_MS:-480000}
+
+  worker-2:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-fbposter}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fbposter}?connection_limit=10&pool_timeout=30
+      REDIS_URL: redis://redis:6379
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      NODE_ENV: ${NODE_ENV:-production}
+      MAX_RETRIES: ${MAX_RETRIES:-3}
+      CSV_RETENTION_HOURS: ${CSV_RETENTION_HOURS:-24}
+      JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-15}
+      FAST_QUEUE_CONCURRENCY: ${FAST_QUEUE_CONCURRENCY:-60}
+      MEDIA_QUEUE_CONCURRENCY: ${MEDIA_QUEUE_CONCURRENCY:-8}
+      VIDEO_UPLOAD_TIMEOUT_MS: ${VIDEO_UPLOAD_TIMEOUT_MS:-480000}
+
+  worker-3:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-fbposter}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fbposter}?connection_limit=10&pool_timeout=30
+      REDIS_URL: redis://redis:6379
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      NODE_ENV: ${NODE_ENV:-production}
+      MAX_RETRIES: ${MAX_RETRIES:-3}
+      CSV_RETENTION_HOURS: ${CSV_RETENTION_HOURS:-24}
+      JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-15}
+      FAST_QUEUE_CONCURRENCY: ${FAST_QUEUE_CONCURRENCY:-60}
+      MEDIA_QUEUE_CONCURRENCY: ${MEDIA_QUEUE_CONCURRENCY:-8}
+      VIDEO_UPLOAD_TIMEOUT_MS: ${VIDEO_UPLOAD_TIMEOUT_MS:-480000}
+
+volumes:
+  pgdata:
+  redisdata:
+  upload-data:

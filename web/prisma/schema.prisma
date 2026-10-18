@@ -1,0 +1,144 @@
+// ═══════════════════════════════════════════════════════
+// FB Auto-Poster v2 — Prisma Schema
+// 1:1 port of v1 SQLAlchemy models, plus queue-related fields.
+// ═══════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id           String    @id @default(cuid())
+  username     String    @unique
+  email        String    @unique
+  passwordHash String
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  accounts     Account[]
+  jobs         Job[]
+  posts        Post[]
+  passwordResets PasswordReset[]
+}
+
+model PasswordReset {
+  id        String   @id @default(cuid())
+  email     String   // lowercase, indexed for lookup
+  codeHash  String   // bcrypt hash of 6-digit code (never store raw)
+  attempts  Int      @default(0)
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime @default(now())
+
+  user      User?    @relation(fields: [email], references: [email], onDelete: Cascade)
+
+  @@index([email])
+  @@index([expiresAt])
+}
+
+model Account {
+  id                 String   @id @default(cuid())
+  userId             String
+  user               User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name               String
+  fbPageAccessToken  String   // encrypted at rest (AES-256-GCM)
+  fbPageId           String
+  fbApiVersion       String   @default("v20.0")
+  fbPagePictureUrl   String?  // page profile picture CDN url (fetched+refreshed by validate worker; public, not a secret)
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  jobs               Job[]
+  posts              Post[]
+
+  @@index([userId])
+}
+
+model Job {
+  id              String    @id @default(cuid())
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accountId       String
+  account         Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  filename        String
+  originalFilename String
+  status          String    @default("pending") // pending|running|paused|completed|failed
+  intervalMinutes Int       @default(60)
+  totalPosts      Int       @default(0)
+  completedPosts  Int       @default(0)
+  failedPosts     Int       @default(0)
+  createdAt       DateTime  @default(now())
+  startedAt       DateTime?
+  completedAt     DateTime?
+  csvDeleted      Boolean   @default(false)
+  csvDeletedAt    DateTime?
+  errorMessage    String?
+  posts           Post[]
+
+  @@index([userId])
+  @@index([accountId])
+}
+
+model Post {
+  id             String    @id @default(cuid())
+  jobId          String
+  job            Job       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  userId         String
+  user           User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  accountId      String
+  account        Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  caption        String
+  mediaUrl       String
+  postType       String    @default("image") // text|image|video|reel
+  comment        String?
+  commentPosted  Boolean   @default(false)
+  commentError   String?
+  status         String    @default("pending") // pending|scheduled|posting|posted|failed|deleted
+  scheduledAt    DateTime?
+  postedAt       DateTime?
+  fbPostId       String?
+  errorMessage   String?
+  retryCount     Int       @default(0)
+  bullJobId      String?   // BullMQ job id, for lookup/cancellation
+  csvRowIndex    Int       @default(0) // 0-based CSV row index — preserves user upload order
+  createdAt      DateTime  @default(now())
+  scheduledComments ScheduledComment[]
+
+  @@index([jobId])
+  @@index([userId])
+  @@index([accountId])
+  @@index([status, scheduledAt])
+  @@index([jobId, csvRowIndex]) // fast sorted dashboard listing
+}
+
+model ScheduledComment {
+  id            String    @id @default(cuid())
+  postId        String
+  post          Post      @relation(fields: [postId], references: [id], onDelete: Cascade)
+  message       String
+  delayMinutes  Int       // minutes after the parent post goes live (0 = immediate comment)
+  // Unified comment-job tracking (v2.1):
+  //   csv_delayed — CSV comment_2/comment_3 column with a delay
+  //   immediate   — CSV `comment` column, posted right after the post goes live
+  source        String    @default("csv_delayed") // csv_delayed|immediate
+  accountId     String?   // denormalized Account.id for direct per-account queries
+  fbPostId      String?   // Facebook object id the comment targets (redundant w/ post, kept for retry safety)
+  // Statuses: pending|processing|published|failed|skipped|needs_review
+  // (`published` was `posted` pre-v2.1 — migration renames existing rows)
+  status        String    @default("pending")
+  fbCommentId   String?
+  errorMessage  String?
+  attemptCount  Int       @default(0)
+  lastAttemptAt DateTime?
+  postedAt      DateTime?
+  createdAt     DateTime  @default(now())
+
+  @@index([postId])
+  @@index([status])
+  @@index([accountId])
+  @@index([accountId, status])
+  @@index([status, postedAt])
+}
