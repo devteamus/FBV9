@@ -199,7 +199,7 @@ export default function JobsPage() {
             <label className="text-sm font-medium">CSV file</label>
             <input name="csv" type="file" accept=".csv" required
               className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm file:mr-4 file:rounded file:border-0 file:bg-primary file:px-2 file:py-1 file:text-xs file:text-primary-foreground" />
-            <p className="text-xs text-muted-foreground">Columns required: caption. Optional: media_url (required for image/video/reel, not for text), post_type (text/image/video/reel — default image), comment (posted right after the post goes live), comment_2 + comment_2_delay_minutes, comment_3 + comment_3_delay_minutes (extra comments fired N minutes after the post — e.g. comment_2_delay_minutes=2, comment_3_delay_minutes=5). Leave any of these blank to skip them — nothing is required.</p>
+            <p className="text-xs text-muted-foreground">Columns required: caption. Optional: media_url (required for image/video/reel, not for text), post_type (text/image/video/reel — default image), comment (posted right after the post goes live, or after comment_1_delay_minutes if set), comment_1_delay_minutes (optional — blank/0 = immediate), comment_2 + comment_2_delay_minutes, comment_3 + comment_3_delay_minutes (extra comments fired N minutes after the post — e.g. comment_2_delay_minutes=2, comment_3_delay_minutes=5). Leave any of these blank to skip them — nothing is required.</p>
           </div>
           <div className="flex gap-3 pt-2">
             <button type="submit" disabled={uploading} className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
