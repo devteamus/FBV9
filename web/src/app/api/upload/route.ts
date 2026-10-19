@@ -134,6 +134,7 @@ export async function POST(request: NextRequest) {
       // Extra delayed comments — both fully optional. Any left blank in
       // the CSV are simply never created, so a user who wants zero, one,
       // or two extra comments just fills in what they want.
+      const comment1Delay = (row.comment_1_delay_minutes || "").trim();
       const comment2 = (row.comment_2 || "").trim();
       const comment3 = (row.comment_3 || "").trim();
       const comment2Delay = (row.comment_2_delay_minutes || "").trim();
@@ -153,6 +154,12 @@ export async function POST(request: NextRequest) {
         badRows.push(idx + 2);
       }
       if (comment2.length > 2000 || comment3.length > 2000) {
+        badRows.push(idx + 2);
+      }
+      // comment_1_delay_minutes is optional: blank or 0 = post the comment
+      // right after the post goes live (old behaviour). A positive number
+      // delays it by that many minutes.
+      if (comment1Delay && (isNaN(Number(comment1Delay)) || Number(comment1Delay) < 0)) {
         badRows.push(idx + 2);
       }
       // If a comment text is given, its delay must be a valid positive number
@@ -201,7 +208,13 @@ export async function POST(request: NextRequest) {
         const caption = (row.caption || "").replace(CONTROL_CHARS_RE, "");
         const mediaUrl = (row.media_url || "").replace(ALL_CONTROL_RE, "");
         const rawComment = (row.comment || "").trim();
-        const comment = rawComment ? rawComment.replace(CONTROL_CHARS_RE, "") : null;
+        const comment1DelayNum = Math.round(Number((row.comment_1_delay_minutes || "").trim() || "0"));
+        // Delay > 0 → handled as a delayed ScheduledComment below, so it must
+        // NOT also be stored as the immediate Post.comment.
+        const comment =
+          rawComment && comment1DelayNum <= 0
+            ? rawComment.replace(CONTROL_CHARS_RE, "")
+            : null;
 
         return {
           jobId: job.id,
@@ -278,6 +291,15 @@ export async function POST(request: NextRequest) {
     records.forEach((row, index) => {
       const post = allPosts[index];
       if (!post) return;
+      const comment1 = (row.comment || "").trim();
+      const comment1DelayNum = Math.round(Number((row.comment_1_delay_minutes || "").trim() || "0"));
+      if (comment1 && comment1DelayNum > 0) {
+        scheduledCommentRows.push({
+          postId: post.id,
+          message: comment1.replace(CONTROL_CHARS_RE, ""),
+          delayMinutes: comment1DelayNum,
+        });
+      }
       const comment2 = (row.comment_2 || "").trim();
       const comment3 = (row.comment_3 || "").trim();
       if (comment2) {
