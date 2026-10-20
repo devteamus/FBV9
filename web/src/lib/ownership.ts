@@ -164,6 +164,7 @@ export function serializeJob(j: {
   originalFilename: string;
   status: string;
   intervalMinutes: number;
+  scheduledStartAt?: Date | null;
   totalPosts: number;
   completedPosts: number;
   failedPosts: number;
@@ -180,6 +181,9 @@ export function serializeJob(j: {
     originalFilename: j.originalFilename,
     status: j.status,
     intervalMinutes: j.intervalMinutes,
+    // v2.2: user-selected first-post time (BDT). null = legacy job that
+    // started immediately on upload.
+    scheduledStartAt: j.scheduledStartAt?.toISOString() ?? null,
     totalPosts: j.totalPosts,
     completedPosts: j.completedPosts,
     failedPosts: j.failedPosts,

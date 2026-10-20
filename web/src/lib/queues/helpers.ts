@@ -200,6 +200,13 @@ export async function enqueuePost(
 /**
  * Bulk enqueue posts from a job (e.g. on CSV upload or job resume).
  * Computes each post's scheduledAt based on intervalMinutes.
+ *
+ * SCALABILITY (v2.2): previously this issued one `queue.add` per post —
+ * a 5000-row CSV cost 5000 sequential Redis round-trips inside the
+ * request. Now posts are partitioned per target queue (fast/media) and
+ * added in `addBulk` batches of 500 — one pipelined round-trip per batch.
+ * Timing semantics are unchanged: post i fires at startAt + i*interval,
+ * regardless of which queue/batch it lands in.
  */
 export async function enqueueJobPosts(
   redis: Redis,
@@ -209,26 +216,56 @@ export async function enqueueJobPosts(
     accountId: string;
     pageId: string;
     postType: string;
-    index: number; // 0-based position in job
+    index: number; // 0-based position in the job (across BOTH queues)
     intervalMinutes: number;
     startAt: Date;
   }>
 ): Promise<void> {
+  const now = Date.now();
+  const ADD_BULK_CHUNK = 500;
+
+  // Partition by target queue — one job can mix text/image (fast) and
+  // video/reel (media) rows, and addBulk is per-queue.
+  const partitions = new Map<string, Array<(typeof posts)[number]>>();
   for (const p of posts) {
-    const scheduledAt = new Date(
-      p.startAt.getTime() + p.index * p.intervalMinutes * 60_000
-    );
-    await enqueuePost(
-      redis,
-      {
-        postId: p.id,
-        jobId: p.jobId,
-        accountId: p.accountId,
-        pageId: p.pageId,
-        postType: p.postType,
-      },
-      scheduledAt
-    );
+    const queueName = resolveQueueName(p.postType);
+    let arr = partitions.get(queueName);
+    if (!arr) {
+      arr = [];
+      partitions.set(queueName, arr);
+    }
+    arr.push(p);
+  }
+
+  for (const [queueName, part] of partitions) {
+    const queue = getQueue(queueName, redis);
+    for (let offset = 0; offset < part.length; offset += ADD_BULK_CHUNK) {
+      const chunk = part.slice(offset, offset + ADD_BULK_CHUNK);
+      await queue.addBulk(
+        chunk.map((p) => {
+          const scheduledAt = new Date(
+            p.startAt.getTime() + p.index * p.intervalMinutes * 60_000
+          );
+          const delay = Math.max(0, scheduledAt.getTime() - now);
+          return {
+            name: `post:${p.id}`,
+            data: {
+              postId: p.id,
+              jobId: p.jobId,
+              accountId: p.accountId,
+              pageId: p.pageId,
+              postType: p.postType,
+            } as PostJobData,
+            opts: {
+              // postId as custom jobId = idempotency (a re-add while the
+              // job is still waiting/delayed is a silent no-op).
+              jobId: p.id,
+              ...(delay > 0 ? { delay } : {}),
+            },
+          };
+        })
+      );
+    }
   }
 }
 
@@ -305,31 +342,35 @@ export async function enqueueDeletePost(
 
 /**
  * Remove (cancel) a specific post's BullMQ job.
- * Suffix-aware: also removes rate-limit retry jobs (`${postId}-rl…`)
- * created by processPostJob's backoff path, by scanning the live sets and
- * matching on the job payload's postId (the BullMQ jobId alone no longer
- * uniquely identifies a post's queue entries).
+ *
+ * v2.2 — OOM fix: the old fallback scanned whole-queue state lists
+ * (`getJobs(["waiting","delayed","active"])`) which materializes every
+ * job in the queue in Node memory — an unbounded spike that can OOM-kill
+ * the web process once tens of thousands of delayed jobs exist.
+ *
+ * Instead we probe by DIRECT id lookups only:
+ *   1. `postId` — the standard enqueue id
+ *   2. `${postId}-rl${scheduledAt.getTime()}` — the deterministic
+ *      rate-limit retry id minted by processPostJob (its retryTag is
+ *      derived from the post's persisted scheduledAt, so it can be
+ *      reconstructed here without any scan).
+ *
+ * Anything not found under those ids has no live queue entry for this
+ * post; a stale pre-v2.2 retry job (old `rl${Date.now()}` tag) is
+ * neutralized later by the atomic status guard in processPostJob.
  */
 export async function cancelPostJob(
   redis: Redis,
   postId: string,
-  postType: string
+  postType: string,
+  scheduledAt?: Date | null
 ): Promise<boolean> {
-  const queueName = resolveQueueName(postType);
-  const queue = getQueue(queueName, redis);
   try {
-    const job = await queue.getJob(postId);
-    if (job) {
-      await job.remove();
-      return true;
-    }
-    for (const state of ["waiting", "delayed", "active"] as const) {
-      const jobs = await queue.getJobs([state]);
-      for (const j of jobs) {
-        if (j.data && (j.data as PostJobData).postId === postId) {
-          await j.remove();
-          return true;
-        }
+    const queue = getQueue(resolveQueueName(postType), redis);
+    if (await removeIfNotActive(queue, postId)) return true;
+    if (scheduledAt) {
+      if (await removeIfNotActive(queue, `${postId}-rl${scheduledAt.getTime()}`)) {
+        return true;
       }
     }
   } catch {
@@ -339,22 +380,80 @@ export async function cancelPostJob(
 }
 
 /**
- * Cancel all BullMQ jobs for a given job ID.
+ * Fetch a job by id and remove it unless it is currently active.
+ * Active jobs are mid-flight inside a worker processor — they will
+ * complete/fail on their own within seconds; forcibly removing them
+ * makes BullMQ's own bookkeeping error out.
+ */
+async function removeIfNotActive(
+  queue: Queue,
+  jobId: string
+): Promise<boolean> {
+  const job = await queue.getJob(jobId);
+  if (!job) return false;
+  const state = await job.getState();
+  if (state === "active" || state === "unknown") return false;
+  await job.remove();
+  return true;
+}
+
+/**
+ * Cancel the BullMQ entries of a job's posts — bounded, scan-free.
+ *
+ * v2.2 — OOM fix: the previous implementation (cancelJobPosts) scanned
+ * whole-queue state lists with `getJobs(["waiting","delayed","active"])`,
+ * which loads EVERY job in the queue into Node memory. With 500 accounts
+ * per user and multiple active jobs each (tens of thousands of delayed
+ * jobs in Redis), a single pause/delete click could spike the web
+ * process by hundreds of MB and crash it (maxmemory noeviction keeps the
+ * jobs IN Redis, so queue size grows unbounded with active schedules).
+ *
+ * This version takes the job's own posts up-front (bounded by the job's
+ * row count, ≤ MAX_CSV_ROWS) and removes each one via direct id lookups
+ * (standard id + deterministic rate-limit retry id). Per-post failures
+ * are isolated — one bad lookup never aborts the pause/delete.
+ *
  * Used when a job is paused or deleted.
  */
-export async function cancelJobPosts(
+export async function cancelJobPostsByIds(
   redis: Redis,
-  jobId: string
+  posts: Array<{
+    id: string;
+    postType: string;
+    scheduledAt?: Date | null;
+  }>
 ): Promise<number> {
   let cancelled = 0;
-  for (const queueName of [FAST_QUEUE, MEDIA_QUEUE]) {
-    const queue = getQueue(queueName, redis);
-    const jobs = await queue.getJobs(["waiting", "delayed", "active"]);
-    for (const job of jobs) {
-      if (job.data.jobId === jobId) {
-        await job.remove();
-        cancelled++;
-      }
+  // v2.3 — latency fix: these probes used to run fully sequentially —
+  // pausing/deleting a 5000-post job cost ~10-15k one-at-a-time Redis
+  // round-trips (multi-second API request, reverse-proxy timeouts).
+  // Each post's probe is independent, so run them in waves of 50
+  // (bounded in-flight load, ~100× faster wall-clock). allSettled
+  // preserves the per-post failure isolation of the old try/catch.
+  const WAVE = 50;
+  for (let off = 0; off < posts.length; off += WAVE) {
+    const wave = posts.slice(off, off + WAVE);
+    const results = await Promise.allSettled(
+      wave.map(async (post) => {
+        const queue = getQueue(resolveQueueName(post.postType), redis);
+        if (await removeIfNotActive(queue, post.id)) {
+          return 1;
+        }
+        if (post.scheduledAt) {
+          if (
+            await removeIfNotActive(
+              queue,
+              `${post.id}-rl${post.scheduledAt.getTime()}`
+            )
+          ) {
+            return 1;
+          }
+        }
+        return 0;
+      })
+    );
+    for (const r of results) {
+      if (r.status === "fulfilled") cancelled += r.value;
     }
   }
   return cancelled;

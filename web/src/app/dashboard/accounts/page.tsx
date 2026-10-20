@@ -2,7 +2,9 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { PageAvatar } from "@/components/ui-kit";
-import { Plus, Trash2, CheckCircle, Loader2 } from "lucide-react";
+import { Plus, Trash2, CheckCircle, Loader2, Upload, FileSpreadsheet } from "lucide-react";
+
+const ACCOUNT_LIMIT = 500;
 
 interface Account {
   id: string;
@@ -19,9 +21,13 @@ export default function AccountsPage() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
+  const [showImport, setShowImport] = useState(false);
   const [form, setForm] = useState({ name: "", fb_page_access_token: "", fb_page_id: "", fb_api_version: "v20.0" });
   const [saving, setSaving] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<string>("");
   const [error, setError] = useState("");
+  const [importError, setImportError] = useState("");
 
   const load = () => {
     api.listAccounts().then((a) => { setAccounts(a); setLoading(false); }).catch(() => setLoading(false));
@@ -42,6 +48,25 @@ export default function AccountsPage() {
       setError(err.message);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleImport = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const formEl = e.currentTarget;
+    setImportError("");
+    setImportResult("");
+    setImporting(true);
+    try {
+      const formData = new FormData(formEl);
+      const res = await api.bulkImportAccounts(formData);
+      setImportResult(res.message);
+      formEl.reset();
+      load();
+    } catch (err: any) {
+      setImportError(err.message);
+    } finally {
+      setImporting(false);
     }
   };
 
@@ -69,16 +94,53 @@ export default function AccountsPage() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">Accounts</h1>
-          <p className="text-sm text-muted-foreground">Connect up to 100 Facebook pages</p>
+          <p className="text-sm text-muted-foreground">Connect up to {ACCOUNT_LIMIT} Facebook pages</p>
         </div>
-        <button
-          onClick={() => setShowForm(!showForm)}
-          className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
-        >
-          <Plus className="h-4 w-4" />
-          Add account
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => { setShowImport(!showImport); setShowForm(false); }}
+            className="inline-flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium hover:bg-muted"
+          >
+            <Upload className="h-4 w-4" />
+            Import CSV
+          </button>
+          <button
+            onClick={() => { setShowForm(!showForm); setShowImport(false); }}
+            className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+          >
+            <Plus className="h-4 w-4" />
+            Add account
+          </button>
+        </div>
       </div>
+
+      {showImport && (
+        <form onSubmit={handleImport} encType="multipart/form-data" className="rounded-xl border bg-card p-6 shadow-sm space-y-4">
+          <h3 className="text-sm font-semibold">Bulk connect accounts from CSV</h3>
+          <p className="text-xs text-muted-foreground">
+            Upload a CSV with these columns — <span className="font-medium text-foreground">Account name</span>, <span className="font-medium text-foreground">Page ID</span>, <span className="font-medium text-foreground">Page Access Token</span> (optional: API Version). Every row becomes a connected page automatically. Already-connected Page IDs and duplicate rows are skipped.
+          </p>
+          <div className="rounded-lg bg-muted/40 px-4 py-3 font-mono text-xs text-muted-foreground">
+            Account name,Page ID,Page Access Token<br />
+            My Brand Page,1234567890,EAAx1y2z…<br />
+            Shop BD,2345678901,EAAb3c4d…
+          </div>
+          {importError && <p className="text-sm text-red-500">{importError}</p>}
+          {importResult && <p className="text-sm text-green-600">{importResult}</p>}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">CSV file</label>
+            <input name="csv" type="file" accept=".csv" required
+              className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm file:mr-4 file:rounded file:border-0 file:bg-primary file:px-2 file:py-1 file:text-xs file:text-primary-foreground" />
+          </div>
+          <div className="flex gap-3 pt-2">
+            <button type="submit" disabled={importing} className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
+              {importing ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileSpreadsheet className="h-4 w-4" />}
+              Import accounts
+            </button>
+            <button type="button" onClick={() => setShowImport(false)} className="rounded-lg border px-4 py-2 text-sm font-medium hover:bg-muted">Cancel</button>
+          </div>
+        </form>
+      )}
 
       {showForm && (
         <form onSubmit={handleCreate} className="rounded-xl border bg-card p-6 shadow-sm space-y-4">
@@ -121,7 +183,7 @@ export default function AccountsPage() {
 
       <div className="rounded-xl border bg-card shadow-sm">
         <div className="border-b px-6 py-4 flex items-center justify-between">
-          <h2 className="text-sm font-semibold">Connected pages ({accounts.length}/100)</h2>
+          <h2 className="text-sm font-semibold">Connected pages ({accounts.length}/{ACCOUNT_LIMIT})</h2>
         </div>
         <div className="divide-y">
           {loading ? (

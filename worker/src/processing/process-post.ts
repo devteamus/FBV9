@@ -97,6 +97,12 @@ export async function processPostJob(jobData: PostJobData): Promise<void> {
     // already exists. Without the suffix the post would be stuck in
     // "scheduled" forever with no queue job. The atomic status guard in
     // this function guarantees a retry can never double-publish.
+    //
+    // v2.2 — the tag is DETERMINISTIC (`rl${retryAt.getTime()}`) and
+    // equals the post's persisted scheduledAt. Pause/delete can then
+    // probe `${postId}-rl${scheduledAtMs}` directly (see
+    // cancelJobPostsByIds) instead of scanning whole queues — which at
+    // tens of thousands of delayed jobs was an OOM risk.
     await enqueuePost(
       redis,
       {
@@ -107,7 +113,7 @@ export async function processPostJob(jobData: PostJobData): Promise<void> {
         postType: post.postType,
       },
       retryAt,
-      `rl${Date.now()}`
+      `rl${retryAt.getTime()}`
     );
     throw new RateLimitExceededError(
       account.fbPageId,
@@ -183,6 +189,8 @@ export async function processPostJob(jobData: PostJobData): Promise<void> {
         // retryTag gives a fresh jobId — see the comment in the pre-check
         // rate-limit branch above for why re-adding the same jobId here
         // (while this job is still active) would be silently dropped.
+        // v2.2: the tag is deterministic (`rl${retryAt.getTime()}`),
+        // matching the post's persisted scheduledAt — see cancelJobPostsByIds.
         await enqueuePost(
           redis,
           {
@@ -193,7 +201,7 @@ export async function processPostJob(jobData: PostJobData): Promise<void> {
             postType: post.postType,
           },
           retryAt,
-          `rl${Date.now()}`
+          `rl${retryAt.getTime()}`
         );
         throw new RateLimitExceededError(
           account.fbPageId,
@@ -318,12 +326,18 @@ async function updateJobCounters(jobId: string): Promise<void> {
 
 /**
  * Check if all posts in a job are done. If so, mark job as completed.
+ *
+ * v2.2: "paused" counts as NOT done. Without this, a post that was
+ * mid-flight when the user clicked pause could land moments later, run
+ * this check, see zero pending/scheduled/posting rows (the rest are all
+ * "paused") and wrongly mark the job completed — which would make it
+ * un-resumable with posts stuck in "paused" forever.
  */
 async function checkJobCompletion(jobId: string): Promise<void> {
   const pendingCount = await prisma.post.count({
     where: {
       jobId,
-      status: { in: ["pending", "scheduled", "posting"] },
+      status: { in: ["pending", "scheduled", "posting", "paused"] },
     },
   });
 

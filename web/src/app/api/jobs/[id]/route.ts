@@ -6,7 +6,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { getSession, AuthError } from "@/lib/auth";
 import { requireJob, serializeJob } from "@/lib/ownership";
-import { cancelJobPosts } from "@/lib/queues/helpers";
+import { cancelJobPostsByIds } from "@/lib/queues/helpers";
 import { getRedis } from "@/lib/redis";
 import { prisma } from "@/lib/prisma";
 import fs from "node:fs";
@@ -40,9 +40,24 @@ export async function DELETE(
     // Ownership check
     const job = await requireJob(userId, id);
 
-    // Cancel any pending BullMQ jobs for this job
+    // v2.2: bounded, scan-free cancel of this job's live queue entries
+    // (the old whole-queue getJobs scan was an OOM risk at scale).
     const redis = getRedis();
-    await cancelJobPosts(redis, id);
+    const livePosts = await prisma.post.findMany({
+      where: {
+        jobId: id,
+        status: { in: ["pending", "scheduled", "posting", "paused"] },
+      },
+      select: { id: true, postType: true, scheduledAt: true },
+    });
+    await cancelJobPostsByIds(
+      redis,
+      livePosts.map((p) => ({
+        id: p.id,
+        postType: p.postType,
+        scheduledAt: p.scheduledAt,
+      }))
+    );
 
     // Delete CSV file if it exists
     const filepath = path.join("/app/uploads", job.filename);

@@ -14,6 +14,7 @@ interface Job {
   accountName: string | null;
   status: string;
   intervalMinutes: number;
+  scheduledStartAt: string | null;
   totalPosts: number;
   completedPosts: number;
   failedPosts: number;
@@ -64,6 +65,16 @@ export default function JobsPage() {
     e.preventDefault();
     const form = e.currentTarget;
     const formData = new FormData(form);
+    // datetime-local → ISO pinned to Bangladesh time (BDT = UTC+6).
+    // The picker value is "YYYY-MM-DDTHH:mm" (some browsers add ":ss");
+    // normalize to the full ISO form the API expects.
+    const startTime = (formData.get("start_time") as string | "").trim();
+    if (startTime) {
+      const m = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})/.exec(startTime);
+      if (m) formData.set("start_at", `${m[1]}:00+06:00`);
+    } else {
+      formData.delete("start_at");
+    }
     setUploading(true);
     try {
       await api.uploadCSV(formData);
@@ -173,7 +184,7 @@ export default function JobsPage() {
       {showUpload && (
         <form onSubmit={handleUpload} encType="multipart/form-data" className="rounded-xl border bg-card p-6 shadow-sm space-y-4">
           <h3 className="text-sm font-semibold">New bulk post job</h3>
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-4">
             <div className="space-y-2">
               <label className="text-sm font-medium">Account</label>
               <select name="account_id" required className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
@@ -188,11 +199,17 @@ export default function JobsPage() {
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">Unit</label>
-              <select name="interval_unit" className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              <select name="interval_unit" defaultValue="hours" className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
                 <option value="minutes">Minutes</option>
                 <option value="hours">Hours</option>
                 <option value="days">Days</option>
               </select>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">Start time (optional)</label>
+              <input name="start_time" type="datetime-local"
+                className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring" />
+              <p className="text-xs text-muted-foreground">Bangladesh time (GMT+6). First post fires at this time, then every interval. Leave empty to start immediately.</p>
             </div>
           </div>
           <div className="space-y-2">
@@ -232,6 +249,11 @@ export default function JobsPage() {
                   <td className="px-6 py-4">
                     <p className="font-medium">{job.originalFilename}</p>
                     <p className="text-xs text-muted-foreground">{new Date(job.createdAt).toLocaleString()}</p>
+                    {job.scheduledStartAt && new Date(job.scheduledStartAt) > new Date() && (
+                      <p className="text-xs text-blue-600">
+                        Starts: {new Date(job.scheduledStartAt).toLocaleString("en-GB", { timeZone: "Asia/Dhaka" })} (BDT)
+                      </p>
+                    )}
                   </td>
                   <td className="px-6 py-4 text-muted-foreground">{job.accountName}</td>
                   <td className="px-6 py-4">
@@ -334,6 +356,7 @@ export default function JobsPage() {
                       p.status === "posted" ? "bg-green-100 text-green-700" :
                       p.status === "failed" ? "bg-red-100 text-red-700" :
                       p.status === "scheduled" ? "bg-blue-100 text-blue-700" :
+                      p.status === "paused" ? "bg-gray-100 text-gray-700" :
                       p.status === "deleting" ? "bg-orange-100 text-orange-700" :
                       p.status === "deleted" ? "bg-gray-200 text-gray-500" :
                       "bg-yellow-100 text-yellow-700"

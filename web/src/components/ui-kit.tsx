@@ -17,6 +17,7 @@ const POST_STATUS_STYLES: Record<string, string> = {
   scheduled: "bg-blue-100 text-blue-700",
   pending: "bg-yellow-100 text-yellow-700",
   posting: "bg-indigo-100 text-indigo-700",
+  paused: "bg-gray-100 text-gray-700", // v2.2: posts resting while their job is paused
   failed: "bg-red-100 text-red-700",
   deleted: "bg-gray-200 text-gray-500",
   deleting: "bg-orange-100 text-orange-700",

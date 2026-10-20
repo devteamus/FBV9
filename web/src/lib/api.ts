@@ -76,6 +76,17 @@ export const api = {
   }) =>
     fetcher("/api/accounts", { method: "POST", body: JSON.stringify(body) }),
 
+  // v2.2: bulk connect accounts from a CSV (Account name, Page ID,
+  // Page Access Token columns).
+  bulkImportAccounts: (formData: FormData) =>
+    fetcher<{
+      success: boolean;
+      created: number;
+      skippedDuplicates: number;
+      skippedAlreadyConnected: number;
+      message: string;
+    }>("/api/accounts/bulk-csv", { method: "POST", body: formData }),
+
   deleteAccount: (id: string) =>
     fetcher(`/api/accounts/${id}`, { method: "DELETE" }),
 
@@ -93,6 +104,7 @@ export const api = {
       originalFilename: string;
       status: string;
       intervalMinutes: number;
+      scheduledStartAt: string | null;
       totalPosts: number;
       completedPosts: number;
       failedPosts: number;

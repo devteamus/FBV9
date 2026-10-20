@@ -29,39 +29,105 @@ const JOB_RETENTION_DAYS = parseInt(
 
 /**
  * Register scheduled cleanup jobs. Call once at worker boot.
+ *
+ * v2.3 — registration race fix: THREE worker containers boot
+ * concurrently (worker, worker-2, worker-3) and each used to run
+ * `getRepeatableJobs → removeRepeatableByKey → add` unsynchronized.
+ * Two workers passing the empty-list check at the same instant both
+ * re-added the same repeatable config → two parallel job chains
+ * (double cleanup runs + orphaned delayed jobs that later fail with
+ * "Couldn't find repeatable job"). A short Redis lock now serializes
+ * the register section; siblings that lose the race VERIFY the jobs
+ * exist (a stale lock resurrected from the AOF after a full-stack
+ * restart must never leave the queue unregistered) and otherwise
+ * wait the lock out and take over.
  */
 export async function registerCleanupJobs(): Promise<void> {
   const redis = getRedis();
+  const LOCK_KEY = "fbv9:cleanup-registration-lock";
+  const LOCK_TTL_S = 15;
+
+  const acquired = await redis.set(
+    LOCK_KEY,
+    String(process.pid),
+    "EX",
+    LOCK_TTL_S,
+    "NX"
+  );
+
+  if (acquired !== "OK") {
+    // A sibling worker holds the lock — either it is registering right
+    // now, or it registered moments ago (lock lingers for its TTL).
+    // Verify the repeatable jobs actually exist before trusting it.
+    let alreadyRegistered = false;
+    const probeQueue = new Queue(CLEANUP_QUEUE, {
+      connection: redis.duplicate(),
+    });
+    try {
+      const existing = await probeQueue.getRepeatableJobs();
+      if (existing.length >= 2) {
+        alreadyRegistered = true;
+      }
+    } finally {
+      await probeQueue.close();
+    }
+    if (alreadyRegistered) {
+      console.log(
+        "[cleanup] Repeatable jobs already registered by a sibling worker — skipping"
+      );
+      return;
+    }
+    // Not actually registered (stale lock from a previous boot cycle)
+    // → wait out the TTL and take over the registration ourselves.
+    await new Promise((r) => setTimeout(r, (LOCK_TTL_S + 1) * 1000));
+    const retried = await redis.set(
+      LOCK_KEY,
+      String(process.pid),
+      "EX",
+      LOCK_TTL_S,
+      "NX"
+    );
+    if (retried !== "OK") {
+      // Someone else genuinely took over in the meantime — trust them.
+      console.log(
+        "[cleanup] Sibling worker is registering cleanup jobs — skipping"
+      );
+      return;
+    }
+  }
+
   const queue = new Queue(CLEANUP_QUEUE, {
     connection: redis.duplicate(),
   });
 
-  // Remove old repeatable jobs before re-registering
-  // (prevents duplicates on worker restart)
-  const existing = await queue.getRepeatableJobs();
-  for (const job of existing) {
-    await queue.removeRepeatableByKey(job.key);
+  try {
+    // Remove old repeatable jobs before re-registering
+    // (prevents duplicates on worker restart)
+    const existing = await queue.getRepeatableJobs();
+    for (const job of existing) {
+      await queue.removeRepeatableByKey(job.key);
+    }
+
+    // CSV cleanup: every 30 minutes
+    await queue.add(
+      "cleanup-csv",
+      {},
+      {
+        repeat: { every: 30 * 60 * 1000 },
+      }
+    );
+
+    // Old job purge: every 6 hours
+    await queue.add(
+      "cleanup-old-jobs",
+      {},
+      {
+        repeat: { every: 6 * 60 * 60 * 1000 },
+      }
+    );
+  } finally {
+    await queue.close();
   }
-
-  // CSV cleanup: every 30 minutes
-  await queue.add(
-    "cleanup-csv",
-    {},
-    {
-      repeat: { every: 30 * 60 * 1000 },
-    }
-  );
-
-  // Old job purge: every 6 hours
-  await queue.add(
-    "cleanup-old-jobs",
-    {},
-    {
-      repeat: { every: 6 * 60 * 60 * 1000 },
-    }
-  );
-
-  await queue.close();
   console.log(
     `[cleanup] Registered: CSV cleanup (every 30m), job purge (every 6h)`
   );

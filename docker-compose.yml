@@ -1,4 +1,69 @@
+# ══════════════════════════════════════════════════════════
+# Worker shared-config anchors (top-level extension fields —
+# Compose only allows `x-*` keys at the ROOT level; inside
+# `services:` they would be parsed as service names).
+# ══════════════════════════════════════════════════════════
+x-worker-env: &worker-env
+  DATABASE_URL: postgresql://${POSTGRES_USER:-fbposter}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fbposter}?connection_limit=10&pool_timeout=30
+  REDIS_URL: redis://redis:6379
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+  NODE_ENV: ${NODE_ENV:-production}
+  MAX_RETRIES: ${MAX_RETRIES:-3}
+  CSV_RETENTION_HOURS: ${CSV_RETENTION_HOURS:-24}
+  JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-15}
+  FAST_QUEUE_CONCURRENCY: ${FAST_QUEUE_CONCURRENCY:-25}
+  MEDIA_QUEUE_CONCURRENCY: ${MEDIA_QUEUE_CONCURRENCY:-5}
+  VIDEO_UPLOAD_TIMEOUT_MS: ${VIDEO_UPLOAD_TIMEOUT_MS:-480000}
+  # In-process liveness endpoint port (healthcheck target, loopback only)
+  WORKER_HEALTH_PORT: ${WORKER_HEALTH_PORT:-3999}
+  # Cap the V8 heap BELOW the 160 MB container limit (see RAM budget)
+  NODE_OPTIONS: "--max-old-space-size=96"
+
+x-worker-deploy: &worker-deploy
+  resources:
+    limits:
+      memory: 160M
+      cpus: "0.5"
+
+x-worker-logging: &worker-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Liveness = the worker's OWN event loop answering an HTTP request on
+# loopback (implemented in worker/src/index.ts). A wedged worker —
+# blocked event loop, deadlocked processor — fails this and Docker
+# restarts it; its in-flight BullMQ jobs are then reclaimed by the
+# other workers via BullMQ's stalled-job mechanism (≤30 s) and the
+# atomic Postgres status guard prevents any duplicate publish.
+x-worker-healthcheck: &worker-healthcheck
+  test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:'+(process.env.WORKER_HEALTH_PORT||3999)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+  interval: 30s
+  timeout: 5s
+  retries: 3
+  start_period: 15s
+
 services:
+  # ─────────────────────────────────────────────────────────────
+  # RAM budget (dedicated stack limit: 1.5 GB / 1536 MB)
+  # ─────────────────────────────────────────────────────────────
+  #   postgres        256 MB
+  #   redis           352 MB  (maxmemory 224mb + AOF/fork headroom)
+  #   web             352 MB  (V8 heap capped at 256 MB)
+  #   worker × 3      480 MB  (160 MB each, V8 heap capped at 96 MB)
+  #   ─────────────────────
+  #   TOTAL          1440 MB  → 96 MB slack inside the 1.5 GB limit
+  #
+  # If you change any single service's limit, re-do this arithmetic —
+  # the sum must stay under 1536 MB or the VPS OOM-killer will start
+  # killing containers (which also affects OTHER apps on the VPS).
+  #
+  # Log rotation (ALL services): json-file, max 10 MB × 3 files.
+  # Docker's DEFAULT is unbounded log growth — on a 75 GB disk that
+  # eventually fills the volume and crashes Postgres/Redis with
+  # "No space left on device". Capped here at ~30 MB per service.
+
   # ──────────────────────────────────────────────
   # PostgreSQL 16
   # ──────────────────────────────────────────────
@@ -16,6 +81,16 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "1.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ──────────────────────────────────────────────
   # Redis 7
@@ -23,7 +98,29 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy noeviction
+    # Memory sizing (v2.3, fits the 1.5 GB stack budget):
+    #   - maxmemory 224mb ≈ room for ~400k BullMQ delayed jobs
+    #     (target scale is 2,000 accounts ≈ tens of thousands of
+    #     scheduled jobs ≈ 20-60 MB — 3-10× headroom).
+    #   - noeviction is REQUIRED for BullMQ: evicting queue keys
+    #     silently deletes scheduled posts. Redis refuses writes
+    #     (uploads fail loudly) when full instead — the safe failure.
+    #   - `--save ""` disables RDB snapshots: AOF (appendonly) is the
+    #     persistence layer. RDB/BGREWRITEAOF fork the server, and the
+    #     fork's copy-on-write memory spike (up to ~2× dataset) can
+    #     OOM-kill Redis inside a tight container memory limit.
+    #   - auto-aof-rewrite-min-size 128mb: AOF rewrites are rare at our
+    #     dataset size (typical AOF < 100 MB), further reducing forks.
+    #   - Container limit 352 MB ≈ 1.5× maxmemory — fork/AOF headroom.
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --save ""
+      --maxmemory 224mb
+      --maxmemory-policy noeviction
+      --auto-aof-rewrite-percentage 200
+      --auto-aof-rewrite-min-size 128mb
     volumes:
       - redisdata:/data
     healthcheck:
@@ -31,6 +128,16 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 352M
+          cpus: "0.5"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ──────────────────────────────────────────────
   # Next.js Web App (UI + API routes)
@@ -63,8 +170,15 @@ services:
       NEXTAUTH_SECRET: ${JWT_SECRET}
       NODE_ENV: ${NODE_ENV:-production}
       MAX_CSV_ROWS: ${MAX_CSV_ROWS:-5000}
+      # Hard byte cap per uploaded CSV (checked BEFORE the file is
+      # buffered into RAM). MAX_CSV_ROWS alone can't prevent a single
+      # oversized request from OOMing the web container.
+      MAX_CSV_BYTES: ${MAX_CSV_BYTES:-10485760}
       CSV_RETENTION_HOURS: ${CSV_RETENTION_HOURS:-24}
       JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-15}
+      # Cap the V8 heap BELOW the container limit so GC pressure kicks
+      # in before the cgroup OOM-killer SIGKILLs the process mid-request.
+      NODE_OPTIONS: "--max-old-space-size=256"
       # Set this to your real https://yourdomain.com in Coolify's env vars UI
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
       # Email / password reset (Resend.com)
@@ -76,10 +190,41 @@ services:
       INSECURE_SECRETS: "false"
     volumes:
       - upload-data:/app/uploads
+    deploy:
+      resources:
+        limits:
+          memory: 352M
+          cpus: "1.0"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   # ──────────────────────────────────────────────
-  # BullMQ Worker (standalone Node/TS process)
+  # BullMQ Worker (standalone Node/TS process) × 3
   # ──────────────────────────────────────────────
+  # NOTE: `deploy.replicas` is intentionally NOT used here. Coolify
+  # injects its own fixed container_name onto every compose service,
+  # which conflicts with replicas (Docker can't create N containers
+  # sharing one name) — this is an open, unresolved Coolify limitation
+  # (github.com/coollabsio/coolify/issues/2131). Instead we run 3
+  # independent, identically-configured worker services below. BullMQ
+  # doesn't care how many separate processes pull from the same Redis
+  # queue, so this behaves identically to 3 replicas.
+  #
+  # Concurrency budget (v2.3, sized for the 1.5 GB stack limit):
+  #   FAST  25 × 3 workers = 75 concurrent text/image posts
+  #   MEDIA  5 × 3 workers = 15 concurrent video/reel uploads
+  # Target scale is 2,000 accounts posting on ≥1-minute intervals —
+  # realistically < 50 due posts per minute system-wide, so 75 fast
+  # slots already gives ~1.5× headroom over the worst realistic burst.
+  # (Previous default of 60 × 3 = 180 concurrent jobs inflated RAM
+  # for no throughput benefit — posts are rate-limited per page at
+  # 25/min anyway.)
+  #
+  # The three workers below share their config through the top-level
+  # x-worker-* YAML anchors (env / deploy / logging / healthcheck).
   worker:
     build:
       context: ./worker
@@ -90,25 +235,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # NOTE: `deploy.replicas` is intentionally NOT used here. Coolify
-    # injects its own fixed container_name onto every compose service,
-    # which conflicts with replicas (Docker can't create N containers
-    # sharing one name) — this is an open, unresolved Coolify limitation
-    # (github.com/coollabsio/coolify/issues/2131). Instead we run 3
-    # independent, identically-configured worker services below. BullMQ
-    # doesn't care how many separate processes pull from the same Redis
-    # queue, so this behaves identically to 3 replicas.
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-fbposter}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fbposter}?connection_limit=10&pool_timeout=30
-      REDIS_URL: redis://redis:6379
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
-      NODE_ENV: ${NODE_ENV:-production}
-      MAX_RETRIES: ${MAX_RETRIES:-3}
-      CSV_RETENTION_HOURS: ${CSV_RETENTION_HOURS:-24}
-      JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-15}
-      FAST_QUEUE_CONCURRENCY: ${FAST_QUEUE_CONCURRENCY:-60}
-      MEDIA_QUEUE_CONCURRENCY: ${MEDIA_QUEUE_CONCURRENCY:-8}
-      VIDEO_UPLOAD_TIMEOUT_MS: ${VIDEO_UPLOAD_TIMEOUT_MS:-480000}
+    environment: *worker-env
+    healthcheck: *worker-healthcheck
+    deploy: *worker-deploy
+    logging: *worker-logging
 
   worker-2:
     build:
@@ -120,17 +250,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-fbposter}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fbposter}?connection_limit=10&pool_timeout=30
-      REDIS_URL: redis://redis:6379
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
-      NODE_ENV: ${NODE_ENV:-production}
-      MAX_RETRIES: ${MAX_RETRIES:-3}
-      CSV_RETENTION_HOURS: ${CSV_RETENTION_HOURS:-24}
-      JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-15}
-      FAST_QUEUE_CONCURRENCY: ${FAST_QUEUE_CONCURRENCY:-60}
-      MEDIA_QUEUE_CONCURRENCY: ${MEDIA_QUEUE_CONCURRENCY:-8}
-      VIDEO_UPLOAD_TIMEOUT_MS: ${VIDEO_UPLOAD_TIMEOUT_MS:-480000}
+    environment: *worker-env
+    healthcheck: *worker-healthcheck
+    deploy: *worker-deploy
+    logging: *worker-logging
 
   worker-3:
     build:
@@ -142,17 +265,10 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    environment:
-      DATABASE_URL: postgresql://${POSTGRES_USER:-fbposter}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-fbposter}?connection_limit=10&pool_timeout=30
-      REDIS_URL: redis://redis:6379
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
-      NODE_ENV: ${NODE_ENV:-production}
-      MAX_RETRIES: ${MAX_RETRIES:-3}
-      CSV_RETENTION_HOURS: ${CSV_RETENTION_HOURS:-24}
-      JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-15}
-      FAST_QUEUE_CONCURRENCY: ${FAST_QUEUE_CONCURRENCY:-60}
-      MEDIA_QUEUE_CONCURRENCY: ${MEDIA_QUEUE_CONCURRENCY:-8}
-      VIDEO_UPLOAD_TIMEOUT_MS: ${VIDEO_UPLOAD_TIMEOUT_MS:-480000}
+    environment: *worker-env
+    healthcheck: *worker-healthcheck
+    deploy: *worker-deploy
+    logging: *worker-logging
 
 volumes:
   pgdata:

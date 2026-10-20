@@ -14,6 +14,7 @@ import { encrypt } from "@/lib/encryption";
 import { serializeAccount } from "@/lib/ownership";
 import { getRedis } from "@/lib/redis";
 import { getValidateQueue } from "@/lib/queues/helpers";
+import { MAX_ACCOUNTS_PER_USER } from "@/lib/config";
 
 const createAccountSchema = z.object({
   name: z.string().trim().min(1).max(100),
@@ -52,10 +53,10 @@ export async function POST(request: NextRequest) {
   try {
     const { sub: userId } = await getSession();
 
-    // Cap: max 100 accounts per user (v1 behavior)
+    // Cap: max 500 accounts per user (v2.2, was 100). Env-configurable.
     const count = await prisma.account.count({ where: { userId } });
-    if (count >= 100) {
-      throw new ValidationError("Maximum 100 accounts reached");
+    if (count >= MAX_ACCOUNTS_PER_USER) {
+      throw new ValidationError(`Maximum ${MAX_ACCOUNTS_PER_USER} accounts reached`);
     }
 
     const body = await request.json();

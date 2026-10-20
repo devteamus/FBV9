@@ -67,6 +67,11 @@ model Job {
   originalFilename String
   status          String    @default("pending") // pending|running|paused|completed|failed
   intervalMinutes Int       @default(60)
+  // User-selected start time (Bangladesh time, GMT+6) for the FIRST post.
+  // Null = start immediately (legacy behavior). Persisted so that a job
+  // paused before its first post ever fires resumes against the ORIGINAL
+  // intended start, not against the resume moment.
+  scheduledStartAt DateTime?
   totalPosts      Int       @default(0)
   completedPosts  Int       @default(0)
   failedPosts     Int       @default(0)
@@ -112,6 +117,9 @@ model Post {
   @@index([accountId])
   @@index([status, scheduledAt])
   @@index([jobId, csvRowIndex]) // fast sorted dashboard listing
+  // Compound index for analytics: per-account postedAt range scans
+  // (published-in-range, last-publish-per-account) at 500-account scale.
+  @@index([accountId, postedAt])
 }
 
 model ScheduledComment {

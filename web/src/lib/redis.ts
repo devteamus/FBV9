@@ -13,6 +13,13 @@ export function getRedis(): Redis {
     redisSingleton = new Redis(url, {
       maxRetriesPerRequest: null, // required by BullMQ
     });
+    // v2.3 — attach an error listener to the base singleton (same
+    // rationale as the worker copy: silences ioredis "Unhandled error
+    // event" noise and guards against a hard throw when Redis is
+    // briefly unreachable).
+    redisSingleton.on("error", (err) => {
+      console.warn(`[redis] connection error: ${err.message}`);
+    });
   }
   return redisSingleton;
 }
