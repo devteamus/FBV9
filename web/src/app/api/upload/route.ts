@@ -1,5 +1,23 @@
 /**
- * POST /api/upload — CSV upload → bulk job creation + BullMQ enqueue
+ * POST /api/upload — CSV / XLSX upload → bulk job creation + BullMQ enqueue
+ *
+ * v2.4 changes:
+ * - Accepts .csv AND .xlsx (Google Sheets / Excel downloads). Parsing lives
+ *   in lib/post-sheet.ts: tolerant headers, auto delimiter (, ; tab),
+ *   UTF-8 / UTF-16, ragged rows, blank "Excel" rows ignored.
+ * - Comment 3 removed. Columns: comment_1 (+ comment_1_delay_minutes) and
+ *   comment_2 (+ comment_2_delay_minutes). Old files with comment_3 columns
+ *   still upload — those columns are ignored and a warning is returned.
+ * - FIX "Could not process this CSV": parse errors used to escape as a
+ *   generic 500. They are now reported as precise 400s (row number +
+ *   reason), and every remaining failure names its stage.
+ * - FIX: delayed-comment rows are now created INSIDE the job transaction,
+ *   BEFORE anything is enqueued (previously created after enqueue, so a
+ *   post firing immediately could publish before its comments existed).
+ * - FIX: interactive-transaction timeout raised (default 5 s is too short
+ *   for a 5000-row file → "Transaction already closed").
+ * - FIX: failing to keep a copy of the upload on disk (volume permissions)
+ *   no longer kills the upload — the copy is only used for retention.
  *
  * v2.2 changes:
  * - OPTIONAL `start_at` field: user-selected start time in Bangladesh time
@@ -30,16 +48,17 @@ import { prisma } from "@/lib/prisma";
 import { requireAccount } from "@/lib/ownership";
 import { enqueueJobPosts, cancelJobPostsByIds } from "@/lib/queues/helpers";
 import { getRedis } from "@/lib/redis";
-import { parse } from "csv-parse/sync";
+import { parsePostSheet } from "@/lib/post-sheet";
 import { writeFile, mkdir } from "node:fs/promises";
 import path from "node:path";
 import crypto from "node:crypto";
 
 const VALID_TYPES = new Set(["text", "image", "video", "reel"]);
+const MAX_DELAY_MINUTES = 43_200; // 30 days — also keeps the value inside Postgres INT
 const CONTROL_CHARS_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f]/g;
 const ALL_CONTROL_RE = /[\x00-\x1f]/g;
 
-// Rate limit: 20 uploads per hour per IP
+// Rate limit: UPLOAD_LIMIT_PER_HOUR (default 300) uploads per hour per IP
 //
 // v2.3 — memory-leak fix: entries used to be added per unique IP and
 // NEVER removed (only reset when the same IP returned after its
@@ -48,7 +67,8 @@ const ALL_CONTROL_RE = /[\x00-\x1f]/g;
 // grows past UPLOAD_MAP_CEILING, and the ceiling itself is a hard cap
 // (further IPs are rate-limited until the next sweep frees space).
 const uploadAttempts = new Map<string, { count: number; resetAt: number }>();
-const UPLOAD_LIMIT = 20;
+// 300/hour default: one CSV per page × 200 pages must not hit the limit.
+const UPLOAD_LIMIT = parseInt(process.env.UPLOAD_LIMIT_PER_HOUR || "300", 10);
 const UPLOAD_WINDOW_MS = 60 * 60 * 1000;
 const UPLOAD_MAP_CEILING = 10_000;
 
@@ -80,6 +100,38 @@ function checkUploadRateLimit(ip: string): boolean {
   }
   entry.count++;
   return entry.count <= UPLOAD_LIMIT;
+}
+
+// ── In-flight memory gate ────────────────────────────────────────
+// Parsing a 25 MB file needs ~10× its size in RAM. Without a gate, a few
+// simultaneous big uploads would OOM-kill the web container (everyone's
+// session dies). Uploads wait their turn instead: at most
+// UPLOAD_INFLIGHT_BYTES (default 30 MB of files) are processed at once —
+// i.e. one 25 MB file, or many small ones.
+const INFLIGHT_LIMIT = parseInt(process.env.UPLOAD_INFLIGHT_BYTES || String(30 * 1024 * 1024), 10);
+let inflightBytes = 0;
+const waiters: Array<() => void> = [];
+
+async function acquireUploadSlot(bytes: number): Promise<() => void> {
+  const need = Math.min(bytes, INFLIGHT_LIMIT); // a single file is always admitted eventually
+  const deadline = Date.now() + 120_000;
+  while (inflightBytes > 0 && inflightBytes + need > INFLIGHT_LIMIT) {
+    if (Date.now() > deadline) {
+      throw new ValidationError("The server is busy processing other uploads. Please try again in a minute.");
+    }
+    await new Promise<void>((resolve) => {
+      waiters.push(resolve);
+      setTimeout(resolve, 2_000); // re-check periodically
+    });
+  }
+  inflightBytes += need;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    inflightBytes -= need;
+    waiters.splice(0).forEach((w) => w());
+  };
 }
 
 // Client/server clock-skew tolerance for `start_at` (2 minutes). Anything
@@ -122,10 +174,22 @@ function parseStartTime(raw: string | null): Date | null {
   return new Date(Math.max(parsed.getTime(), Date.now()));
 }
 
+type Stage = "auth" | "read" | "parse" | "save" | "db" | "queue";
+
+/** Parse a delay cell. Returns null when blank, NaN when invalid. */
+function parseDelay(raw: string): number | null {
+  const v = raw.trim();
+  if (!v) return null;
+  const n = Number(v.replace(",", "."));
+  return Number.isFinite(n) ? Math.round(n) : NaN;
+}
+
 export async function POST(request: NextRequest) {
   let filePath: string | null = null;
   let createdJobId: string | null = null;
   let enqueued = false;
+  let stage: Stage = "auth";
+  let releaseSlot: (() => void) | null = null;
   let enqueuePayload: Array<{
     id: string;
     postType: string;
@@ -145,30 +209,30 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    stage = "read";
     const formData = await request.formData();
-    const file = formData.get("csv") as File | null;
+    const file = (formData.get("csv") ?? formData.get("file")) as File | null;
     const accountId = formData.get("account_id") as string | null;
-    const intervalValue = parseInt(formData.get("interval_value") as string || "1", 10);
+    const intervalValue = parseInt((formData.get("interval_value") as string) || "1", 10);
     const intervalUnit = (formData.get("interval_unit") as string) || "hours";
 
-    if (!file) throw new ValidationError("No file part");
+    if (!file || typeof file === "string") throw new ValidationError("No file part");
     if (!accountId) throw new ValidationError("account_id is required");
 
-    // v2.3 — OOM guard: hard byte cap checked BEFORE the body is
-    // buffered into RAM. MAX_CSV_ROWS alone cannot prevent a single
-    // oversized request from consuming the web container's memory
-    // budget (Next.js route handlers have no built-in body-size limit,
-    // and formData() buffers the entire part before this code runs).
-    // file.size comes from the multipart headers — free to read.
-    const MAX_CSV_BYTES = parseInt(
-      process.env.MAX_CSV_BYTES || String(10 * 1024 * 1024),
-      10
-    );
-    if (file.size > MAX_CSV_BYTES) {
+    // OOM guard: hard byte cap checked BEFORE the body is buffered.
+    // .xlsx is a zip (decompresses in RAM) so it gets a tighter cap.
+    const isXlsx = file.name.toLowerCase().endsWith(".xlsx");
+    const MAX_CSV_BYTES = parseInt(process.env.MAX_CSV_BYTES || String(25 * 1024 * 1024), 10);
+    const MAX_XLSX_BYTES = parseInt(process.env.MAX_XLSX_BYTES || String(25 * 1024 * 1024), 10);
+    const maxBytes = isXlsx ? Math.min(MAX_XLSX_BYTES, MAX_CSV_BYTES) : MAX_CSV_BYTES;
+    if (file.size > maxBytes) {
       throw new ValidationError(
-        `CSV file is too large (${(file.size / 1024 / 1024).toFixed(1)} MB) — max allowed is ${(MAX_CSV_BYTES / 1024 / 1024).toFixed(0)} MB`
+        `File is too large (${(file.size / 1024 / 1024).toFixed(1)} MB) — max allowed is ${(maxBytes / 1024 / 1024).toFixed(0)} MB`
       );
     }
+
+    // Wait for memory budget BEFORE buffering/parsing the file
+    releaseSlot = await acquireUploadSlot(file.size);
 
     // Ownership check on account
     const account = await requireAccount(userId, accountId);
@@ -187,137 +251,123 @@ export async function POST(request: NextRequest) {
     else intervalMinutes = 60;
 
     // Optional user-selected start time (Bangladesh time, GMT+6).
-    // null → legacy behavior: the first post fires immediately.
     const userStartAt = parseStartTime(formData.get("start_at") as string | null);
     const startAt = userStartAt ?? new Date();
 
-    // Validate file extension
     const originalName = file.name;
-    if (!originalName.toLowerCase().endsWith(".csv")) {
-      throw new ValidationError("Only .csv files allowed");
-    }
+    const buffer = Buffer.from(await file.arrayBuffer());
 
-    // Read file content
-    const rawBytes = await file.arrayBuffer();
-    const buffer = Buffer.from(rawBytes);
+    // ── Parse (CSV or XLSX) ─────────────────────────────────────
+    stage = "parse";
+    const sheet = await parsePostSheet(buffer, originalName);
+    const records = sheet.rows;
 
-    // Content sniff: reject binaries (same as v1)
-    if (buffer.includes(0x00)) {
-      throw new ValidationError("File does not look like a valid CSV");
-    }
-    try {
-      buffer.toString("utf-8");
-    } catch {
-      try {
-        buffer.toString("latin1");
-      } catch {
-        throw new ValidationError("File does not look like a valid CSV");
-      }
-    }
-
-    // Parse CSV
-    const records = parse(buffer.toString("utf-8"), {
-      columns: true,
-      skip_empty_lines: true,
-      bom: true,
-    }) as Record<string, string>[];
-
-    const MAX_CSV_ROWS = parseInt(process.env.MAX_CSV_ROWS || "5000", 10);
-    if (records.length === 0) throw new ValidationError("CSV has no rows");
+    const MAX_CSV_ROWS = parseInt(process.env.MAX_CSV_ROWS || "10000", 10);
+    if (records.length === 0) throw new ValidationError("The file has no data rows.");
     if (records.length > MAX_CSV_ROWS) {
       throw new ValidationError(
-        `CSV has ${records.length} rows — max allowed is ${MAX_CSV_ROWS}`
+        `The file has more than ${MAX_CSV_ROWS} data rows — max allowed is ${MAX_CSV_ROWS}. Split it into two files.`
       );
     }
 
-    // Validate all rows before importing anything
-    const badRows: number[] = [];
-    for (let idx = 0; idx < records.length; idx++) {
-      const row = records[idx];
-      const ptype = (row.post_type || "image").toLowerCase().trim() || "image";
-      const type = VALID_TYPES.has(ptype) ? ptype : "image";
-      const url = (row.media_url || "").trim();
-      const caption = row.caption || "";
-      const comment = row.comment || "";
-      // Extra delayed comments — both fully optional. Any left blank in
-      // the CSV are simply never created, so a user who wants zero, one,
-      // or two extra comments just fills in what they want.
-      const comment1Delay = (row.comment_1_delay_minutes || "").trim();
-      const comment2 = (row.comment_2 || "").trim();
-      const comment3 = (row.comment_3 || "").trim();
-      const comment2Delay = (row.comment_2_delay_minutes || "").trim();
-      const comment3Delay = (row.comment_3_delay_minutes || "").trim();
+    // ── Validate every row, report exact row + reason ───────────
+    const problems: string[] = [];
+    const addProblem = (rowNumber: number, msg: string) => {
+      if (problems.length < 10) problems.push(`Row ${rowNumber}: ${msg}`);
+    };
 
-      if (type !== "text") {
+    for (const row of records) {
+      const ptype = row.post_type.toLowerCase().trim();
+      if (ptype && !VALID_TYPES.has(ptype)) {
+        addProblem(row.rowNumber, `post_type "${row.post_type.trim()}" must be text, image, video or reel`);
+        continue;
+      }
+      const type = ptype || "image";
+      const url = row.media_url.trim();
+
+      if (type === "text") {
+        if (!row.caption.trim()) addProblem(row.rowNumber, "caption is required for text posts");
+      } else {
+        let ok = false;
         try {
-          const parsed = new URL(url);
-          if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname) {
-            badRows.push(idx + 2);
-          }
+          const u = new URL(url);
+          ok = ["http:", "https:"].includes(u.protocol) && !!u.hostname;
         } catch {
-          badRows.push(idx + 2);
+          ok = false;
+        }
+        if (!ok) addProblem(row.rowNumber, `media_url must be a full http(s) link for ${type} posts`);
+      }
+      if (url.length > 2000) addProblem(row.rowNumber, "media_url is longer than 2000 characters");
+      if (row.caption.length > 5000) addProblem(row.rowNumber, "caption is longer than 5000 characters");
+      if (row.comment_1.length > 2000) addProblem(row.rowNumber, "comment_1 is longer than 2000 characters");
+      if (row.comment_2.length > 2000) addProblem(row.rowNumber, "comment_2 is longer than 2000 characters");
+
+      // comment_1_delay_minutes: optional. blank/0 = right after the post.
+      const d1 = parseDelay(row.comment_1_delay_minutes);
+      if (d1 !== null && (Number.isNaN(d1) || d1 < 0 || d1 > MAX_DELAY_MINUTES)) {
+        addProblem(row.rowNumber, `comment_1_delay_minutes must be a number of minutes between 0 and ${MAX_DELAY_MINUTES}`);
+      }
+      // comment_2 needs its own delay (1+ minutes).
+      if (row.comment_2.trim()) {
+        const d2 = parseDelay(row.comment_2_delay_minutes);
+        if (d2 === null || Number.isNaN(d2) || d2 < 1 || d2 > MAX_DELAY_MINUTES) {
+          addProblem(row.rowNumber, `comment_2 needs comment_2_delay_minutes (a number of minutes, 1 or more)`);
         }
       }
-      if (url.length > 2000 || caption.length > 5000 || comment.length > 2000) {
-        badRows.push(idx + 2);
-      }
-      if (comment2.length > 2000 || comment3.length > 2000) {
-        badRows.push(idx + 2);
-      }
-      // comment_1_delay_minutes is optional: blank or 0 = post the comment
-      // right after the post goes live (old behaviour). A positive number
-      // delays it by that many minutes.
-      if (comment1Delay && (isNaN(Number(comment1Delay)) || Number(comment1Delay) < 0)) {
-        badRows.push(idx + 2);
-      }
-      // If a comment text is given, its delay must be a valid positive number
-      // (and vice versa — a delay with no message makes no sense).
-      if (comment2 && (!comment2Delay || isNaN(Number(comment2Delay)) || Number(comment2Delay) < 1)) {
-        badRows.push(idx + 2);
-      }
-      if (comment3 && (!comment3Delay || isNaN(Number(comment3Delay)) || Number(comment3Delay) < 1)) {
-        badRows.push(idx + 2);
-      }
-      if (badRows.length >= 10) break;
+      if (problems.length >= 10) break;
     }
-    if (badRows.length > 0) {
-      const preview = badRows.slice(0, 10).join(", ");
+    if (problems.length > 0) {
       throw new ValidationError(
-        `Invalid row(s): ${preview}${badRows.length >= 10 ? " ..." : ""}. media_url is required (full http(s) link) for image/video/reel rows, caption max 5000 chars, comment max 2000 chars.`
+        `Please fix these rows and upload again:\n${problems.join("\n")}${problems.length >= 10 ? "\n…" : ""}`
       );
     }
 
-    // Save CSV file (isolated path: /app/uploads/{userId}/{jobId}/...)
-    // Server-generated path only, never client-supplied (§7A)
-    const jobId = crypto.randomUUID(); // pre-generate for filename
-    const uploadDir = path.join("/app/uploads", userId, jobId);
-    await mkdir(uploadDir, { recursive: true });
-    const filename = `${jobId}.csv`;
-    filePath = path.join(uploadDir, filename);
-    await writeFile(filePath, buffer);
+    // ── Global queue-size guard ─────────────────────────────────
+    // Every scheduled post is a delayed job in Redis (noeviction, 224 MB).
+    // If Redis fills up, enqueue AND the worker's own writes start failing
+    // for everybody — so refuse new uploads long before that.
+    const MAX_PENDING_POSTS = parseInt(process.env.MAX_PENDING_POSTS || "150000", 10);
+    const pendingNow = await prisma.post.count({
+      where: { status: { in: ["scheduled", "pending"] } },
+    });
+    if (pendingNow + records.length > MAX_PENDING_POSTS) {
+      throw new ValidationError(
+        `The queue is full (${pendingNow} posts already scheduled, limit ${MAX_PENDING_POSTS}). ` +
+          `Wait for some posts to publish, or upload a smaller file.`
+      );
+    }
 
-    // ── Build every Post row up-front (v2.2) ────────────────────
-    // ids are generated HERE (crypto.randomUUID) so the BullMQ jobIds are
-    // known without a re-query, and each row already carries its final
-    // "scheduled" status + scheduledAt. One createMany = one DB write.
+    // ── Keep a copy of the upload (best effort) ─────────────────
+    // Only used for retention/cleanup — a storage problem (volume
+    // permissions, disk full) must NOT block the upload.
+    stage = "save";
+    const jobId = crypto.randomUUID();
+    const ext = sheet.format === "xlsx" ? "xlsx" : "csv";
+    const filename = `${jobId}.${ext}`;
+    try {
+      const uploadDir = path.join("/app/uploads", userId, jobId);
+      await mkdir(uploadDir, { recursive: true });
+      const target = path.join(uploadDir, filename);
+      await writeFile(target, buffer);
+      filePath = target;
+    } catch (saveErr) {
+      console.warn("[upload] could not store a copy of the file (continuing):", saveErr);
+    }
+
+    // ── Build every Post + comment row up-front ─────────────────
     const postRows = records.map((row, index) => {
-      const ptype = (row.post_type || "image").toLowerCase().trim() || "image";
-      const type = VALID_TYPES.has(ptype) ? ptype : "image";
-      const caption = (row.caption || "").replace(CONTROL_CHARS_RE, "");
-      const mediaUrl = (row.media_url || "").replace(ALL_CONTROL_RE, "");
-      const rawComment = (row.comment || "").trim();
-      const comment1DelayNum = Math.round(Number((row.comment_1_delay_minutes || "").trim() || "0"));
-      // Delay > 0 → handled as a delayed ScheduledComment below, so it must
-      // NOT also be stored as the immediate Post.comment.
-      const comment =
-        rawComment && comment1DelayNum <= 0
-          ? rawComment.replace(CONTROL_CHARS_RE, "")
-          : null;
+      const ptype = row.post_type.toLowerCase().trim();
+      const type = ptype || "image";
+      const caption = row.caption.replace(CONTROL_CHARS_RE, "");
+      const mediaUrl = row.media_url.replace(ALL_CONTROL_RE, "");
+      const c1 = row.comment_1.trim();
+      const d1 = parseDelay(row.comment_1_delay_minutes) ?? 0;
+      // Immediate comment_1 is stored on the post (worker queues it right
+      // after publishing); a delayed one becomes a ScheduledComment below.
+      const comment = c1 && d1 <= 0 ? c1.replace(CONTROL_CHARS_RE, "") : null;
 
       const id = crypto.randomUUID();
-      const scheduledAt = new Date(
-        startAt.getTime() + index * intervalMinutes * 60_000
-      );
+      const scheduledAt = new Date(startAt.getTime() + index * intervalMinutes * 60_000);
       return {
         id,
         jobId,
@@ -327,37 +377,67 @@ export async function POST(request: NextRequest) {
         mediaUrl,
         postType: type,
         comment,
-        csvRowIndex: index, // preserve CSV order — used for dashboard sorting
+        csvRowIndex: index,
         status: "scheduled" as const,
         scheduledAt,
         bullJobId: id, // postId doubles as the BullMQ jobId (idempotency)
       };
     });
 
-    // Create Job + Posts in a transaction
-    const createdJob = await prisma.$transaction(async (tx) => {
-      const job = await tx.job.create({
-        data: {
-          userId,
-          accountId,
-          filename: path.join(userId, jobId, filename), // relative path for DB
-          originalFilename: originalName,
-          status: "pending",
-          intervalMinutes,
-          scheduledStartAt: userStartAt, // null = started immediately (legacy)
-          totalPosts: records.length,
-        },
-      });
-
-      if (postRows.length > 0) {
-        await tx.post.createMany({ data: postRows });
+    const scheduledCommentRows: { postId: string; message: string; delayMinutes: number }[] = [];
+    records.forEach((row, index) => {
+      const post = postRows[index];
+      const c1 = row.comment_1.trim();
+      const d1 = parseDelay(row.comment_1_delay_minutes) ?? 0;
+      if (c1 && d1 > 0) {
+        scheduledCommentRows.push({
+          postId: post.id,
+          message: c1.replace(CONTROL_CHARS_RE, ""),
+          delayMinutes: d1,
+        });
       }
-
-      return job;
+      const c2 = row.comment_2.trim();
+      if (c2) {
+        scheduledCommentRows.push({
+          postId: post.id,
+          message: c2.replace(CONTROL_CHARS_RE, ""),
+          delayMinutes: parseDelay(row.comment_2_delay_minutes) as number,
+        });
+      }
     });
+
+    // ── Job + Posts + delayed comments in ONE transaction ───────
+    // Comments are written BEFORE enqueue so that a post which fires
+    // immediately always finds its comment rows.
+    stage = "db";
+    const createdJob = await prisma.$transaction(
+      async (tx) => {
+        const job = await tx.job.create({
+          data: {
+            userId,
+            accountId,
+            filename: path.join(userId, jobId, filename), // relative path for DB
+            originalFilename: originalName,
+            status: "pending",
+            intervalMinutes,
+            scheduledStartAt: userStartAt, // null = started immediately (legacy)
+            totalPosts: records.length,
+          },
+        });
+        await tx.post.createMany({ data: postRows });
+        if (scheduledCommentRows.length > 0) {
+          await tx.scheduledComment.createMany({
+            data: scheduledCommentRows.map((c) => ({ ...c, accountId })),
+          });
+        }
+        return job;
+      },
+      { maxWait: 10_000, timeout: 60_000 }
+    );
     createdJobId = createdJob.id;
 
-    // Enqueue all posts into BullMQ (batched addBulk, v2.2)
+    // ── Enqueue all posts into BullMQ (batched addBulk) ─────────
+    stage = "queue";
     const redis = getRedis();
     const postsToEnqueue = postRows.map((p, index) => ({
       id: p.id,
@@ -369,7 +449,6 @@ export async function POST(request: NextRequest) {
       intervalMinutes,
       startAt,
     }));
-    // Snapshot for the rollback path (cancel partial entries by direct id)
     enqueuePayload = postRows.map((p) => ({
       id: p.id,
       postType: p.postType,
@@ -380,64 +459,20 @@ export async function POST(request: NextRequest) {
       await enqueueJobPosts(redis, postsToEnqueue);
       enqueued = true;
     } catch (enqueueErr) {
-      // Roll the whole job back — no half-scheduled uploads. Posts in the
-      // DB are already "scheduled", so without this the job would look
-      // alive while nothing is in the queue (stuck forever).
+      // Roll the whole job back — no half-scheduled uploads.
       console.error("[upload] enqueue failed — rolling back job", enqueueErr);
       try {
         await cancelJobPostsByIds(redis, enqueuePayload);
       } catch {
         // best effort — the job delete below still removes DB state
       }
-      await prisma.job.delete({ where: { id: createdJob.id } }); // cascades posts
+      await prisma.job.delete({ where: { id: createdJob.id } }); // cascades posts + comments
       createdJobId = null;
       throw enqueueErr;
     }
 
-    // Create any optional extra delayed comments (comment_2/comment_3 and
-    // delayed comment_1). Rows that left these blank contribute nothing —
-    // that's the auto-skip behavior. postRows is in the same order as
-    // `records`, so index-mapping stays correct without a re-query.
-    const scheduledCommentRows: {
-      postId: string;
-      message: string;
-      delayMinutes: number;
-    }[] = [];
-    records.forEach((row, index) => {
-      const post = postRows[index];
-      if (!post) return;
-      const comment1 = (row.comment || "").trim();
-      const comment1DelayNum = Math.round(Number((row.comment_1_delay_minutes || "").trim() || "0"));
-      if (comment1 && comment1DelayNum > 0) {
-        scheduledCommentRows.push({
-          postId: post.id,
-          message: comment1.replace(CONTROL_CHARS_RE, ""),
-          delayMinutes: comment1DelayNum,
-        });
-      }
-      const comment2 = (row.comment_2 || "").trim();
-      const comment3 = (row.comment_3 || "").trim();
-      if (comment2) {
-        scheduledCommentRows.push({
-          postId: post.id,
-          message: comment2.replace(CONTROL_CHARS_RE, ""),
-          delayMinutes: Math.round(Number(row.comment_2_delay_minutes)),
-        });
-      }
-      if (comment3) {
-        scheduledCommentRows.push({
-          postId: post.id,
-          message: comment3.replace(CONTROL_CHARS_RE, ""),
-          delayMinutes: Math.round(Number(row.comment_3_delay_minutes)),
-        });
-      }
-    });
-    if (scheduledCommentRows.length > 0) {
-      await prisma.scheduledComment.createMany({ data: scheduledCommentRows });
-    }
-
-    // Mark job as running (it is live from the API's perspective — the
-    // individual posts carry their own future scheduledAt times)
+    // Job is live from the API's perspective
+    stage = "db";
     await prisma.job.update({
       where: { id: createdJob.id },
       data: { status: "running", startedAt: new Date() },
@@ -449,11 +484,17 @@ export async function POST(request: NextRequest) {
     });
 
     return NextResponse.json(
-      { success: true, job: serializeJob(finalJob) },
+      {
+        success: true,
+        job: serializeJob(finalJob),
+        format: sheet.format,
+        rows: records.length,
+        warnings: sheet.warnings,
+      },
       { status: 201 }
     );
-  } catch (err) {
-    // Clean up uploaded file on error
+  } catch (err: any) {
+    // Clean up the stored copy on error
     if (filePath) {
       try {
         const { unlink } = await import("node:fs/promises");
@@ -462,11 +503,8 @@ export async function POST(request: NextRequest) {
         // best effort
       }
     }
-    // Safety net: if the job row was created but the enqueue step never
-    // completed (e.g. Redis unreachable between the DB write and the
-    // enqueue), remove it. Once `enqueued` is true the job is LIVE in the
-    // queue — a later, unrelated error (comment rows, status update) must
-    // NOT delete a working job out from under the user.
+    // If the job row exists but was never enqueued, remove it. Once
+    // `enqueued` is true the job is LIVE — a later error must NOT delete it.
     if (createdJobId && !enqueued) {
       try {
         await prisma.job.delete({ where: { id: createdJobId } });
@@ -475,17 +513,30 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    if (err instanceof AuthError) {
+    if (err instanceof AuthError || err instanceof ValidationError) {
       return NextResponse.json({ error: err.message }, { status: err.status });
     }
-    if (err instanceof ValidationError) {
+    // requireAccount() throws NotFound/Forbidden with a status
+    if (typeof err?.status === "number" && err.status >= 400 && err.status < 500 && err.message) {
       return NextResponse.json({ error: err.message }, { status: err.status });
     }
-    console.error("[upload]", err);
+
+    console.error(`[upload] unexpected failure at stage "${stage}"`, err);
+    const code = err?.code || err?.name || "unknown";
+    const hint =
+      stage === "db"
+        ? /^P20(21|22)$/.test(String(err?.code))
+          ? "The database is not migrated — restart the web container so `prisma migrate deploy` runs."
+          : "Database error while saving. Please try again."
+        : stage === "queue"
+          ? "The job queue (Redis) is not reachable. Please try again in a minute."
+          : "Please check the file and try again.";
     return NextResponse.json(
-      { error: "Could not process this CSV. Please check the format and try again." },
+      { error: `Could not process this file. ${hint} [ref: ${stage}/${code}]` },
       { status: 500 }
     );
+  } finally {
+    releaseSlot?.();
   }
 }
 

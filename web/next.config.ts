@@ -19,7 +19,15 @@ const nextConfig: NextConfig = {
   //
   // This is the officially recommended approach for BullMQ + Next.js:
   // https://nextjs.org/docs/app/api-reference/next-config-js/serverExternalPackages
-  serverExternalPackages: ["bullmq", "ioredis"],
+  // Middleware (src/middleware.ts) runs on /api/*, and Next buffers the
+  // request body for it with a 10 MB default cap — anything larger is
+  // silently TRUNCATED, which corrupts multipart uploads (a 15 MB CSV
+  // would fail with a generic error). Raise it above our 25 MB upload cap.
+  experimental: {
+    middlewareClientMaxBodySize: "30mb",
+  },
+
+  serverExternalPackages: ["bullmq", "ioredis", "exceljs"],
 
   // ─────────────────────────────────────────────────────────────
   // Webpack: force `bullmq` / `ioredis` to be external everywhere

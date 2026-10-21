@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { Upload, Pause, Play, Trash2, Eye, Loader2 } from "lucide-react";
+import { Upload, Pause, Play, Trash2, Eye, Loader2, Download } from "lucide-react";
 
 interface Account {
   id: string;
@@ -52,6 +52,7 @@ export default function JobsPage() {
   const [selectedPostIds, setSelectedPostIds] = useState<Set<string>>(new Set());
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [deletingPostId, setDeletingPostId] = useState<string | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   const load = () => {
     Promise.all([api.listJobs(), api.listAccounts()])
@@ -77,14 +78,16 @@ export default function JobsPage() {
     }
     setUploading(true);
     try {
-      await api.uploadCSV(formData);
+      const res = await api.uploadCSV(formData);
       setShowUpload(false);
+      form.reset(); // only clear the form after a successful upload
       load();
+      if (res?.warnings?.length) alert(res.warnings.join("\n"));
     } catch (err: any) {
+      // Keep the form + chosen file so the user can fix the sheet and retry
       alert(err.message);
     } finally {
       setUploading(false);
-      form.reset();
     }
   };
 
@@ -97,8 +100,24 @@ export default function JobsPage() {
 
   const refreshPosts = async () => {
     if (!selectedJob) return;
-    const p = await api.getJobPosts(selectedJob.id);
+    // Reload everything loaded so far (at least the first page)
+    const p = await api.getJobPosts(selectedJob.id, {
+      limit: Math.min(2000, Math.max(1000, posts.length)),
+    });
     setPosts(p);
+  };
+
+  const loadMorePosts = async () => {
+    if (!selectedJob) return;
+    setLoadingMore(true);
+    try {
+      const next = await api.getJobPosts(selectedJob.id, { limit: 1000, offset: posts.length });
+      setPosts((prev) => [...prev, ...next]);
+    } catch (err: any) {
+      alert(err.message);
+    } finally {
+      setLoadingMore(false);
+    }
   };
 
   const deletablePostIds = posts.filter((p) => p.status === "posted" && p.fbPostId).map((p) => p.id);
@@ -213,10 +232,21 @@ export default function JobsPage() {
             </div>
           </div>
           <div className="space-y-2">
-            <label className="text-sm font-medium">CSV file</label>
-            <input name="csv" type="file" accept=".csv" required
+            <label className="text-sm font-medium">CSV or Excel file</label>
+            <input name="csv" type="file" accept=".csv,.xlsx" required
               className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm file:mr-4 file:rounded file:border-0 file:bg-primary file:px-2 file:py-1 file:text-xs file:text-primary-foreground" />
-            <p className="text-xs text-muted-foreground">Columns required: caption. Optional: media_url (required for image/video/reel, not for text), post_type (text/image/video/reel — default image), comment (posted right after the post goes live, or after comment_1_delay_minutes if set), comment_1_delay_minutes (optional — blank/0 = immediate), comment_2 + comment_2_delay_minutes, comment_3 + comment_3_delay_minutes (extra comments fired N minutes after the post — e.g. comment_2_delay_minutes=2, comment_3_delay_minutes=5). Leave any of these blank to skip them — nothing is required.</p>
+            <div className="flex flex-wrap items-center gap-2">
+              <a href="/api/upload/template?format=csv" download
+                className="inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium hover:bg-muted">
+                <Download className="h-3.5 w-3.5" /> Demo CSV
+              </a>
+              <a href="/api/upload/template?format=xlsx" download
+                className="inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium hover:bg-muted">
+                <Download className="h-3.5 w-3.5" /> Demo Excel (.xlsx)
+              </a>
+              <span className="text-xs text-muted-foreground">Google Sheets: File → Download → CSV or Excel (.xlsx), then upload.</span>
+            </div>
+            <p className="text-xs text-muted-foreground">Columns: caption (required), media_url (required for image/video/reel), post_type (text/image/video/reel — default image), comment_1 + comment_1_delay_minutes (blank/0 = right after the post), comment_2 + comment_2_delay_minutes (minutes after the post, 1 or more). Leave any comment blank to skip it.</p>
           </div>
           <div className="flex gap-3 pt-2">
             <button type="submit" disabled={uploading} className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
@@ -375,6 +405,15 @@ export default function JobsPage() {
                 </div>
               ))}
             </div>
+            {selectedJob.totalPosts > posts.length && (
+              <div className="mt-3 flex items-center justify-between text-xs text-muted-foreground">
+                <span>Showing {posts.length} of {selectedJob.totalPosts} posts</span>
+                <button onClick={loadMorePosts} disabled={loadingMore}
+                  className="rounded-lg border px-3 py-1.5 font-medium hover:bg-muted disabled:opacity-50">
+                  {loadingMore ? "Loading..." : "Load more"}
+                </button>
+              </div>
+            )}
           </div>
         </div>
       )}

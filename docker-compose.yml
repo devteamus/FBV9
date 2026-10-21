@@ -50,10 +50,10 @@ services:
   # ─────────────────────────────────────────────────────────────
   #   postgres        256 MB
   #   redis           352 MB  (maxmemory 224mb + AOF/fork headroom)
-  #   web             352 MB  (V8 heap capped at 256 MB)
+  #   web             768 MB  (V8 heap capped at 448 MB — v2.4: 25 MB CSV/XLSX uploads need ~230 MB RSS to parse)
   #   worker × 3      480 MB  (160 MB each, V8 heap capped at 96 MB)
   #   ─────────────────────
-  #   TOTAL          1440 MB  → 96 MB slack inside the 1.5 GB limit
+  #   TOTAL          1856 MB  → needs a VPS with ≥ 2 GB RAM (v2.4; was 1440 MB)
   #
   # If you change any single service's limit, re-do this arithmetic —
   # the sum must stay under 1536 MB or the VPS OOM-killer will start
@@ -169,16 +169,23 @@ services:
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
       NEXTAUTH_SECRET: ${JWT_SECRET}
       NODE_ENV: ${NODE_ENV:-production}
-      MAX_CSV_ROWS: ${MAX_CSV_ROWS:-5000}
+      MAX_CSV_ROWS: ${MAX_CSV_ROWS:-10000}
+      MAX_CSV_COLUMNS: ${MAX_CSV_COLUMNS:-10000}
       # Hard byte cap per uploaded CSV (checked BEFORE the file is
       # buffered into RAM). MAX_CSV_ROWS alone can't prevent a single
       # oversized request from OOMing the web container.
-      MAX_CSV_BYTES: ${MAX_CSV_BYTES:-10485760}
+      MAX_CSV_BYTES: ${MAX_CSV_BYTES:-26214400}
+      # .xlsx files are parsed as a stream (low memory); cap matches the CSV cap (25 MB)
+      MAX_XLSX_BYTES: ${MAX_XLSX_BYTES:-26214400}
+      # Upload throttles (v2.4)
+      UPLOAD_LIMIT_PER_HOUR: ${UPLOAD_LIMIT_PER_HOUR:-300}
+      UPLOAD_INFLIGHT_BYTES: ${UPLOAD_INFLIGHT_BYTES:-31457280}
+      MAX_PENDING_POSTS: ${MAX_PENDING_POSTS:-150000}
       CSV_RETENTION_HOURS: ${CSV_RETENTION_HOURS:-24}
       JOB_RETENTION_DAYS: ${JOB_RETENTION_DAYS:-15}
       # Cap the V8 heap BELOW the container limit so GC pressure kicks
       # in before the cgroup OOM-killer SIGKILLs the process mid-request.
-      NODE_OPTIONS: "--max-old-space-size=256"
+      NODE_OPTIONS: "--max-old-space-size=448"
       # Set this to your real https://yourdomain.com in Coolify's env vars UI
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
       # Email / password reset (Resend.com)
@@ -193,7 +200,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 352M
+          memory: 768M
           cpus: "1.0"
     logging:
       driver: json-file
@@ -239,6 +246,11 @@ services:
     healthcheck: *worker-healthcheck
     deploy: *worker-deploy
     logging: *worker-logging
+    # Share the uploads volume so the worker's retention cleanup can
+    # actually delete the stored CSV/XLSX copies (web and worker both run
+    # as uid 1001). Without this the files accumulate forever.
+    volumes:
+      - upload-data:/app/uploads
 
   worker-2:
     build:
@@ -254,6 +266,11 @@ services:
     healthcheck: *worker-healthcheck
     deploy: *worker-deploy
     logging: *worker-logging
+    # Share the uploads volume so the worker's retention cleanup can
+    # actually delete the stored CSV/XLSX copies (web and worker both run
+    # as uid 1001). Without this the files accumulate forever.
+    volumes:
+      - upload-data:/app/uploads
 
   worker-3:
     build:
@@ -269,6 +286,11 @@ services:
     healthcheck: *worker-healthcheck
     deploy: *worker-deploy
     logging: *worker-logging
+    # Share the uploads volume so the worker's retention cleanup can
+    # actually delete the stored CSV/XLSX copies (web and worker both run
+    # as uid 1001). Without this the files accumulate forever.
+    volumes:
+      - upload-data:/app/uploads
 
 volumes:
   pgdata:

@@ -117,7 +117,7 @@ export const api = {
 
   getJob: (id: string) => fetcher(`/api/jobs/${id}`),
 
-  getJobPosts: (id: string) =>
+  getJobPosts: (id: string, opts: { limit?: number; offset?: number } = {}) =>
     fetcher<Array<{
       id: string;
       jobId: string;
@@ -142,7 +142,9 @@ export const api = {
         status: string;
         errorMessage: string | null;
       }>;
-    }>>(`/api/jobs/${id}/posts`),
+    }>>(
+      `/api/jobs/${id}/posts?limit=${opts.limit ?? 1000}&offset=${opts.offset ?? 0}`
+    ),
 
   deletePostFromFacebook: (postId: string) =>
     fetcher<{ success: boolean; queued: boolean }>(
@@ -166,7 +168,12 @@ export const api = {
     fetcher(`/api/jobs/${id}`, { method: "DELETE" }),
 
   uploadCSV: (formData: FormData) =>
-    fetcher("/api/upload", { method: "POST", body: formData, headers: {} }),
+    fetcher<{
+      success: boolean;
+      format: "csv" | "xlsx";
+      rows: number;
+      warnings: string[];
+    }>("/api/upload", { method: "POST", body: formData, headers: {} }),
 
   stats: () =>
     fetcher<{

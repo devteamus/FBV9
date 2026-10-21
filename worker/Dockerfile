@@ -33,6 +33,10 @@ COPY --from=deps /app/node_modules/@prisma ./node_modules/@prisma
 COPY --from=deps /app/node_modules/.bin/prisma ./node_modules/.bin/prisma
 COPY --from=deps /app/node_modules/prisma ./node_modules/prisma
 
+# Same path + owner as the web image so the shared upload-data volume is
+# writable no matter which container creates it first.
+RUN mkdir -p /app/uploads && chown worker:worker /app/uploads
+
 USER worker
 
 CMD ["node", "dist/index.js"]
