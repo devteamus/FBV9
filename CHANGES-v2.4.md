@@ -1,6 +1,10 @@
 # v2.4 — upload fixes (CSV + Excel, comment changes)
 
 ## Fixed
+- **Root cause of every upload failure (Prisma P2003):** the Job row was created without
+  the pre-generated `jobId` that every Post row references, so the Post→Job foreign key
+  failed on each upload (this bug exists in v2.3 too and was hidden behind the generic
+  "Could not process this CSV" message). `id: jobId` is now passed to `job.create`.
 - **"Could not process this CSV"** — parse errors (unquoted commas, odd quotes,
   semicolon-delimited Excel exports, UTF-16 files) used to escape as a generic
   500. They now upload when possible, or return the exact row + reason.

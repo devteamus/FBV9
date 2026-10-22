@@ -414,6 +414,10 @@ export async function POST(request: NextRequest) {
       async (tx) => {
         const job = await tx.job.create({
           data: {
+            // MUST be the same id the Post rows reference (postRows[].jobId).
+            // Without it Prisma generates its own cuid and every Post insert
+            // fails the Post→Job foreign key (Prisma P2003).
+            id: jobId,
             userId,
             accountId,
             filename: path.join(userId, jobId, filename), // relative path for DB
