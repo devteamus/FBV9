@@ -30,9 +30,10 @@ import { requireJobOwned } from "@/lib/ownership";
 import { enqueueJobPosts } from "@/lib/queues/helpers";
 import { getRedis } from "@/lib/redis";
 import { prisma } from "@/lib/prisma";
+import { resumePausedComments } from "@/lib/comment-pause";
 
 export async function POST(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
@@ -45,6 +46,20 @@ export async function POST(
         { error: "Job is not paused" },
         { status: 400 }
       );
+    }
+
+    // v2.4 — optional `start_at` (ISO) from "Resume all": the moment this
+    // job's next post should go out. Lets Resume all keep the original
+    // stagger between accounts. It can only DELAY the start — the
+    // anchor rule below (never sooner than last published + interval, never
+    // in the past) always applies on top.
+    let requestedStart = 0;
+    try {
+      const body = await request.json();
+      const t = body?.start_at ? new Date(body.start_at).getTime() : NaN;
+      if (Number.isFinite(t) && t < Date.now() + 60 * 24 * 3600_000) requestedStart = t;
+    } catch {
+      // no / invalid body — normal single-job resume
     }
 
     // Non-terminal posts. "paused" is the normal state here (set by the
@@ -91,7 +106,7 @@ export async function POST(
         // picked at upload (legacy jobs without one: resume moment)
         anchor = job.scheduledStartAt?.getTime() ?? now;
       }
-      const startAt = new Date(Math.max(anchor, now));
+      const startAt = new Date(Math.max(anchor, now, requestedStart));
 
       await enqueueJobPosts(
         redis,
@@ -135,6 +150,14 @@ export async function POST(
       where: { id },
       data: { status: "running" },
     });
+
+    // v2.4 — bring this job's parked comments back (original time if not yet
+    // due, otherwise right after resume, 10 s apart per account).
+    try {
+      await resumePausedComments(getRedis(), { post: { jobId: id } });
+    } catch (commentErr) {
+      console.error("[jobs:resume] could not resume comments", commentErr);
+    }
 
     return NextResponse.json({ success: true, status: "running" });
   } catch (err) {

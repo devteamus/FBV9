@@ -460,6 +460,25 @@ export async function cancelJobPostsByIds(
 }
 
 /**
+ * Remove the delayed BullMQ jobs of the given ScheduledComment ids
+ * (used when a job / all jobs are paused). Active jobs are left alone;
+ * a job that still fires later is rejected by the DB status guard
+ * (status 'paused' is not publishable). Per-id failures are isolated.
+ */
+export async function cancelCommentJobs(redis: Redis, ids: string[]): Promise<number> {
+  const queue = getQueue(COMMENT_QUEUE, redis);
+  let removed = 0;
+  const WAVE = 50;
+  for (let off = 0; off < ids.length; off += WAVE) {
+    const results = await Promise.allSettled(
+      ids.slice(off, off + WAVE).map((id) => removeIfNotActive(queue, id))
+    );
+    for (const r of results) if (r.status === "fulfilled" && r.value) removed++;
+  }
+  return removed;
+}
+
+/**
  * Close queue connections (for graceful shutdown).
  *
  * Closes ALL singleton Queue handles held by this process. Each Queue

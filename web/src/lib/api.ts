@@ -161,8 +161,20 @@ export const api = {
   pauseJob: (id: string) =>
     fetcher(`/api/jobs/${id}/pause`, { method: "POST" }),
 
-  resumeJob: (id: string) =>
-    fetcher(`/api/jobs/${id}/resume`, { method: "POST" }),
+  resumeJob: (id: string, startAt?: string) =>
+    fetcher(`/api/jobs/${id}/resume`, {
+      method: "POST",
+      ...(startAt ? { body: JSON.stringify({ start_at: startAt }) } : {}),
+    }),
+
+  getResumePlan: () =>
+    fetcher<Array<{ jobId: string; nextDue: string }>>("/api/jobs/resume-plan"),
+
+  pauseAllComments: () =>
+    fetcher<{ success: boolean; paused: number }>("/api/comments/pause-all", { method: "POST" }),
+
+  resumeAllComments: () =>
+    fetcher<{ success: boolean; resumed: number }>("/api/comments/resume-all", { method: "POST" }),
 
   deleteJob: (id: string) =>
     fetcher(`/api/jobs/${id}`, { method: "DELETE" }),

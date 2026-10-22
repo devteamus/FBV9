@@ -19,6 +19,7 @@ import { requireJobOwned } from "@/lib/ownership";
 import { cancelJobPostsByIds } from "@/lib/queues/helpers";
 import { getRedis } from "@/lib/redis";
 import { prisma } from "@/lib/prisma";
+import { pauseComments } from "@/lib/comment-pause";
 
 export async function POST(
   _request: NextRequest,
@@ -73,6 +74,14 @@ export async function POST(
       where: { id },
       data: { status: "paused" },
     });
+
+    // v2.4 — comments pause together with the posts: pending comments of
+    // this job's posts are parked ("paused") and their delayed jobs removed.
+    try {
+      await pauseComments(redis, { post: { jobId: id } });
+    } catch (commentErr) {
+      console.error("[jobs:pause] could not pause comments", commentErr);
+    }
 
     const updated = await prisma.job.findUniqueOrThrow({ where: { id } });
     return NextResponse.json({ success: true, status: updated.status });

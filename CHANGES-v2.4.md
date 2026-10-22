@@ -21,6 +21,22 @@
 - `.csv` and `.xlsx` upload (Google Sheets: File → Download → CSV / Excel).
 - Demo files: `GET /api/upload/template?format=csv|xlsx` (buttons in the upload form).
 
+## New (Jobs page)
+- **Pause all / Resume all** buttons (4 jobs at a time, live progress).
+- **Comments pause with the posts.** Pending comments get status `paused` and their
+  delayed queue jobs are removed (single-job Pause does this too). Pause all also parks
+  the comments of already-finished jobs.
+- **Resume keeps every account on its own schedule:**
+  - next post still in the future → keeps its exact original time (account 3's 2 PM stays 2 PM)
+  - next post came due while paused → restarts in the same order and with the same gaps
+    the accounts originally had (earliest one right now), so accounts don't all fire together
+  - after the first post each job continues at its own +interval, never sooner than
+    last published + interval
+  - paused comments: not yet due → original time; overdue → right after resume,
+    one per account every 10 s
+- New endpoints: `GET /api/jobs/resume-plan`, `POST /api/comments/pause-all`,
+  `POST /api/comments/resume-all`; `POST /api/jobs/[id]/resume` accepts optional `{start_at}`.
+
 ## Changed
 - Comment 3 removed. Columns: `comment_1` (+`comment_1_delay_minutes`),
   `comment_2` (+`comment_2_delay_minutes`). Old `comment` column = comment_1.

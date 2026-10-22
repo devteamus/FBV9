@@ -53,6 +53,7 @@ export default function JobsPage() {
   const [bulkDeleting, setBulkDeleting] = useState(false);
   const [deletingPostId, setDeletingPostId] = useState<string | null>(null);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [bulk, setBulk] = useState<{ action: "pause" | "resume"; done: number; total: number; failed: number } | null>(null);
 
   const load = () => {
     Promise.all([api.listJobs(), api.listAccounts()])
@@ -174,6 +175,100 @@ export default function JobsPage() {
     }
   };
 
+  // ── One-click Pause all / Resume all ─────────────────────────
+  // Pause: every running job + all pending comments stop.
+  // Resume: every paused job continues on ITS OWN schedule —
+  //   • a job whose next post is still in the future keeps that exact time
+  //     (e.g. account 3's 2:00 PM start stays 2:00 PM)
+  //   • jobs whose next post came due while paused restart in the same
+  //     order and with the same gaps they originally had (the earliest one
+  //     right now) — so accounts never all fire at the same moment
+  //   • after the first post, every job continues at its own +interval
+  // Runs the per-job endpoints 4 at a time with live progress.
+  const runBulk = async (action: "pause" | "resume") => {
+    if (bulk) return;
+    let fresh: Job[];
+    try {
+      fresh = await api.listJobs(); // fresh list — the table may be stale
+    } catch (err: any) {
+      alert(err.message);
+      return;
+    }
+    const wanted = action === "pause" ? "running" : "paused";
+    const targets = fresh.filter((j) => j.status === wanted);
+    if (targets.length === 0) {
+      alert(action === "pause" ? "No running jobs to pause." : "No paused jobs to resume.");
+      return;
+    }
+    const msg =
+      action === "pause"
+        ? `Pause ${targets.length} running job(s) and all pending comments? Nothing more will be posted or commented until you resume.`
+        : `Resume ${targets.length} paused job(s) and their comments? Each account continues on its own schedule.`;
+    if (!confirm(msg)) return;
+
+    // Resume: work out each job's start time (keeps the original stagger)
+    const startFor = new Map<string, string>();
+    if (action === "resume") {
+      try {
+        const plan = await api.getResumePlan();
+        const now = Date.now();
+        const due = new Map(plan.map((p) => [p.jobId, new Date(p.nextDue).getTime()]));
+        const overdue = targets.map((j) => due.get(j.id)).filter((t): t is number => t !== undefined && t < now);
+        const earliest = overdue.length ? Math.min(...overdue) : 0;
+        for (const j of targets) {
+          const t = due.get(j.id);
+          if (t === undefined) continue;
+          startFor.set(j.id, new Date(t < now ? now + (t - earliest) : t).toISOString());
+        }
+        // start the earliest ones first
+        targets.sort((a, b) => (startFor.get(a.id) ?? "").localeCompare(startFor.get(b.id) ?? ""));
+      } catch {
+        // plan unavailable — fall back to the per-job rule (still safe)
+      }
+    }
+
+    let next = 0;
+    let done = 0;
+    let failed = 0;
+    const errors: string[] = [];
+    setBulk({ action, done: 0, total: targets.length, failed: 0 });
+
+    const worker = async () => {
+      while (next < targets.length) {
+        const job = targets[next++];
+        try {
+          if (action === "pause") await api.pauseJob(job.id);
+          else await api.resumeJob(job.id, startFor.get(job.id));
+        } catch (err: any) {
+          failed++;
+          if (errors.length < 5) errors.push(`${job.accountName}: ${err.message}`);
+        }
+        done++;
+        setBulk({ action, done, total: targets.length, failed });
+      }
+    };
+    await Promise.all(Array.from({ length: 4 }, worker));
+
+    // Comments of already-finished jobs (their delayed comments are still
+    // queued) — pause / resume them too.
+    try {
+      if (action === "pause") await api.pauseAllComments();
+      else await api.resumeAllComments();
+    } catch (err: any) {
+      errors.push(`comments: ${err.message}`);
+      failed++;
+    }
+
+    setBulk(null);
+    load();
+    if (failed > 0) {
+      alert(`Finished with ${failed} problem(s). Click again to retry the rest.\n${errors.join("\n")}`);
+    }
+  };
+
+  const runningCount = jobs.filter((j) => j.status === "running").length;
+  const pausedCount = jobs.filter((j) => j.status === "paused").length;
+
   const toggleJob = async (job: Job) => {
     if (job.status === "running") await api.pauseJob(job.id);
     else if (job.status === "paused") await api.resumeJob(job.id);
@@ -193,11 +288,23 @@ export default function JobsPage() {
           <h1 className="text-2xl font-semibold tracking-tight">Jobs</h1>
           <p className="text-sm text-muted-foreground">Manage your bulk posting campaigns</p>
         </div>
-        <button onClick={() => setShowUpload(!showUpload)}
-          className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">
-          <Upload className="h-4 w-4" />
-          Upload CSV
-        </button>
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <button onClick={() => runBulk("pause")} disabled={!!bulk || runningCount === 0}
+            className="inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50">
+            {bulk?.action === "pause" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Pause className="h-4 w-4" />}
+            {bulk?.action === "pause" ? `Pausing ${bulk.done}/${bulk.total}` : `Pause all (${runningCount})`}
+          </button>
+          <button onClick={() => runBulk("resume")} disabled={!!bulk || pausedCount === 0}
+            className="inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-sm font-medium hover:bg-muted disabled:opacity-50">
+            {bulk?.action === "resume" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+            {bulk?.action === "resume" ? `Resuming ${bulk.done}/${bulk.total}` : `Resume all (${pausedCount})`}
+          </button>
+          <button onClick={() => setShowUpload(!showUpload)}
+            className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90">
+            <Upload className="h-4 w-4" />
+            Upload CSV
+          </button>
+        </div>
       </div>
 
       {showUpload && (
